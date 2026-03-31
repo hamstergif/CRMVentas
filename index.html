@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CRM Prospectos</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+
+  <div id="loginView" class="page">
+    <div class="grid g2 login-layout">
+      <div class="card">
+        <div class="card-body">
+          <div class="pill">CRM Prospectos Sync</div>
+          <h1 class="title-xl">PC y celular sincronizados</h1>
+          <p class="muted" style="font-size:18px;max-width:720px">Una sola app responsive para escritorio y teléfono, con login real, leads, agenda, tareas y coach diario usando Supabase.</p>
+          <div class="grid g3" style="margin-top:18px">
+            <div class="feature-card"><strong>Sincronización real</strong><div class="muted tiny" style="margin-top:6px">Lo que hacés en PC aparece en el celu.</div></div>
+            <div class="feature-card"><strong>Coach diario</strong><div class="muted tiny" style="margin-top:6px">Se reinicia automáticamente cada día.</div></div>
+            <div class="feature-card"><strong>Tareas separadas</strong><div class="muted tiny" style="margin-top:6px">Manual y por gestión, sin farming de puntos.</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card auth-card">
+        <div class="card-body">
+          <h2 id="authTitle">Ingresar</h2>
+          <div id="signupNameWrap" class="hidden" style="margin-top:12px">
+            <label>Nombre visible</label>
+            <input id="signupName" placeholder="Rodrigo S">
+          </div>
+          <div style="margin-top:12px">
+            <label>Email</label>
+            <input id="authEmail" type="email" placeholder="tuemail@gmail.com">
+          </div>
+          <div style="margin-top:12px">
+            <label>Contraseña</label>
+            <input id="authPassword" type="password" placeholder="********">
+          </div>
+          <div class="row" style="margin-top:16px">
+            <button id="authPrimaryBtn" class="btn primary">Entrar</button>
+            <button id="authSwitchBtn" class="btn">Crear cuenta</button>
+          </div>
+          <p class="muted tiny" style="margin-top:12px">Usá tu email para registrarte. El nombre visible se usa dentro del CRM.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="appView" class="page hidden">
+    <div class="topbar card">
+      <div class="card-body">
+        <div class="row between">
+          <div>
+            <div class="pill">CRM Prospectos Sync</div>
+            <h2 class="section-title" style="margin-top:10px">Prospectos</h2>
+            <div id="headerSub" class="muted"></div>
+          </div>
+          <div class="row">
+            <button id="newLeadBtn" class="btn">Nuevo contacto</button>
+            <button id="importBtn" class="btn">Importar Excel</button>
+            <button id="exportBtn" class="btn">Exportar Excel</button>
+            <button id="notifyBtn" class="btn">Alertas</button>
+            <button id="logoutBtn" class="btn">Salir</button>
+          </div>
+          <input id="excelInput" type="file" accept=".xlsx,.xls" class="hidden">
+        </div>
+      </div>
+    </div>
+
+    <div class="grid g4" style="margin-top:16px">
+      <button class="metric card" data-metric="due"><div class="metric-inner"><small>Para hoy</small><strong id="metricDue">0</strong></div></button>
+      <button class="metric card" data-metric="withoutPhone"><div class="metric-inner"><small>Sin teléfono</small><strong id="metricPhone">0</strong></div></button>
+      <button class="metric card" data-metric="highPriority"><div class="metric-inner"><small>Alta prioridad</small><strong id="metricPriority">0</strong></div></button>
+      <button class="metric card" data-metric="contacted"><div class="metric-inner"><small>Trabajados</small><strong id="metricContacted">0</strong></div></button>
+    </div>
+
+    <section id="tab-inicio" style="margin-top:16px">
+      <div class="grid g2">
+        <div class="card">
+          <div class="card-body">
+            <div class="row between">
+              <div>
+                <div class="muted">Progreso</div>
+                <div style="margin-top:6px"><span id="tierEmoji">🧭</span> <strong id="tierLabel">Explorador</strong></div>
+              </div>
+              <div>
+                <div class="muted">XP</div>
+                <strong id="pointsValue">0</strong>
+              </div>
+            </div>
+            <div class="muted" style="margin-top:14px">Racha: <strong id="streakValue">0</strong> días</div>
+            <div class="progress-wrap" style="margin-top:12px"><div id="progressBar" class="progress-bar"></div></div>
+            <div id="progressText" class="muted tiny" style="margin-top:8px"></div>
+            <div id="levelTrack" class="row" style="margin-top:12px"></div>
+          </div>
+        </div>
+        <div class="card motivation-card">
+          <div class="card-body">
+            <div style="opacity:.8">Motivación del momento</div>
+            <div id="motivationBox" style="font-size:20px;font-weight:700;line-height:1.45;margin-top:10px"></div>
+          </div>
+        </div>
+      </div>
+      <div id="focusGrid" class="grid g3" style="margin-top:16px"></div>
+    </section>
+
+    <section id="tab-leads" class="hidden" style="margin-top:16px">
+      <div class="card">
+        <div class="card-body">
+          <div class="grid g5">
+            <div class="search-wrap"><span>🔎</span><input id="searchInput" placeholder="Buscar empresa, rubro, provincia..."></div>
+            <select id="filterProvincia"></select>
+            <select id="filterRubro"></select>
+            <select id="filterEstado"></select>
+            <div class="row">
+              <label class="checkbox-line"><input id="filterPend" type="checkbox"><span>Solo pendientes</span></label>
+              <label class="checkbox-line"><input id="filterFav" type="checkbox"><span>Solo favoritos</span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="grid g2" style="margin-top:16px">
+        <div class="card">
+          <div class="card-body">
+            <h3 id="filteredCountTitle">Leads</h3>
+            <div id="leadList" style="max-height:68vh;overflow:auto"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="row between">
+              <div>
+                <h3 id="detailTitle">Seleccioná un lead</h3>
+                <div id="detailSub" class="muted"></div>
+              </div>
+              <div class="row">
+                <button id="editLeadBtn" class="btn small">Editar</button>
+                <button id="favLeadBtn" class="btn small">Fav</button>
+                <button id="deleteLeadBtn" class="btn small danger">Borrar</button>
+              </div>
+            </div>
+            <div id="leadDetail" style="margin-top:14px"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-agenda" class="hidden" style="margin-top:16px">
+      <div class="card">
+        <div class="card-body">
+          <h3>Agenda inteligente</h3>
+          <div id="agendaList" class="grid" style="margin-top:12px"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-coach" class="hidden" style="margin-top:16px">
+      <div class="grid g2">
+        <div class="card">
+          <div class="card-body">
+            <div class="row between">
+              <h3>Coach diario</h3>
+              <div class="muted tiny">Se reinicia cada día</div>
+            </div>
+            <div id="coachTasksWrap" class="grid" style="margin-top:14px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="row between">
+              <h3>Consejos</h3>
+              <div class="muted tiny">Rotan cada 30 minutos</div>
+            </div>
+            <div id="tipsWrap" class="grid" style="margin-top:14px"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-tareas" class="hidden" style="margin-top:16px">
+      <div class="grid g2">
+        <div class="card">
+          <div class="card-body">
+            <h3>Crear tarea manual</h3>
+            <div style="margin-top:12px"><label>Título</label><input id="taskTitleInput" placeholder="Ej: Volver a llamar a proveedor de Córdoba"></div>
+            <div style="margin-top:12px"><label>Fecha</label><input id="taskDateInput" type="date"></div>
+            <div style="margin-top:12px"><label>Nota</label><textarea id="taskNoteInput" placeholder="Qué tenés que recordar o preguntar"></textarea></div>
+            <div class="row" style="margin-top:16px"><button id="createTaskBtn" class="btn primary">Crear tarea</button></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <h3>Tareas pendientes</h3>
+            <div id="taskList" class="grid" style="margin-top:12px"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <nav class="bottomnav">
+      <button data-tab="inicio" class="active">Inicio</button>
+      <button data-tab="leads">Leads</button>
+      <button data-tab="agenda">Agenda</button>
+      <button data-tab="coach">Coach</button>
+      <button data-tab="tareas">Tareas</button>
+    </nav>
+  </div>
+
+  <div id="modalBg" class="modal-backdrop">
+    <div class="modal">
+      <div class="card-body">
+        <div class="row between">
+          <div><h3 id="modalTitle">Nuevo contacto</h3><div id="modalSub" class="muted"></div></div>
+          <button id="closeModalBtn" class="btn">Cerrar</button>
+        </div>
+        <div class="grid g5" style="margin-top:16px">
+          <div><label>Empresa</label><input id="mEmpresa"></div>
+          <div><label>Contacto</label><input id="mContacto"></div>
+          <div><label>Teléfono</label><input id="mTelefono"></div>
+          <div><label>Email</label><input id="mEmail"></div>
+          <div><label>Provincia</label><input id="mProvincia"></div>
+          <div><label>Localidad</label><input id="mLocalidad"></div>
+          <div><label>Rubro</label><input id="mRubro"></div>
+          <div><label>Web</label><input id="mWeb"></div>
+          <div><label>Dirección</label><input id="mDireccion"></div>
+          <div><label>Origen habitual</label><input id="mOrigen"></div>
+          <div><label>Tipo operaciones</label><input id="mTipo"></div>
+          <div><label>Tamaño</label><input id="mTamano"></div>
+          <div><label>Estado</label><select id="mEstado"></select></div>
+          <div><label>Prioridad</label><select id="mPrioridad"></select></div>
+          <div><label>Score</label><input id="mScore" type="number"></div>
+          <div><label>Último contacto</label><input id="mUltimo" type="date"></div>
+          <div><label>Próximo seguimiento</label><input id="mProximo" type="date"></div>
+          <div class="row" style="align-self:end"><label class="checkbox-line"><input id="mFav" type="checkbox"><span>Favorito</span></label></div>
+        </div>
+        <div style="margin-top:16px"><label>Notas</label><textarea id="mNotas"></textarea></div>
+        <div class="row" style="margin-top:16px">
+          <button id="saveModalBtn" class="btn primary">Guardar</button>
+          <button id="cancelModalBtn" class="btn">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
