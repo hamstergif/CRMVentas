@@ -34,3 +34,9 @@ Para login, primero registrate con tu email.
 ## Nota sobre Auth
 Si al registrarte te pide confirmar email y no querés eso para probar:
 Supabase → Authentication → Providers → Email → desactivar "Confirm email"
+
+
+Correcciones:
+- Crear/editar/borrar leads y tareas refresca al instante.
+- Las tareas muestran vencimiento.
+- Recordatorios por notificación para tareas que vencen hoy o están vencidas.

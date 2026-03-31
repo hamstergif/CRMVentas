@@ -134,6 +134,40 @@ function taskIdForLead(lead) {
   return `${lead.id}::${lead.task_version || 1}`;
 }
 
+function taskDueLevel(task) {
+  if (!task?.due_date) return "sin";
+  const d = diffDays(todayStr(), task.due_date);
+  if (d === null) return "sin";
+  if (d > 0) return "vencida";
+  if (d === 0) return "hoy";
+  return "ok";
+}
+
+function taskDueBadge(task) {
+  const level = taskDueLevel(task);
+  if (level === "vencida") return '<span class="badge danger">Vencida</span>';
+  if (level === "hoy") return '<span class="badge warn">Vence hoy</span>';
+  if (task?.due_date) return '<span class="badge">Programada</span>';
+  return '<span class="badge">Sin fecha</span>';
+}
+
+function notifyDueTasks() {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const dueTasks = (state.tasks || []).filter(t => {
+    const lvl = taskDueLevel(t);
+    return lvl === "hoy" || lvl === "vencida";
+  });
+  dueTasks.forEach(task => {
+    const key = `crm-sync-notified::${state.user?.id || "anon"}::${task.id}::${todayStr()}`;
+    if (localStorage.getItem(key)) return;
+    const body = taskDueLevel(task) === "vencida"
+      ? `La tarea "${task.title}" está vencida.`
+      : `La tarea "${task.title}" vence hoy.`;
+    new Notification("Tarea pendiente", { body });
+    localStorage.setItem(key, "1");
+  });
+}
+
 function selectedLead() {
   return state.leads.find(l => l.id === state.selectedLeadId) || null;
 }
@@ -161,6 +195,14 @@ function smartQueue() {
     .sort((a,b) => b.urgency - a.urgency)
     .slice(0,20);
 }
+
+function actionableQueue() {
+  return smartQueue().filter(l => {
+    const due = dueLevel(l);
+    return ["vencido", "hoy", "pronto"].includes(due) || l.estado === "Nuevo" || l.estado === "Por contactar" || !l.telefono;
+  });
+}
+
 
 function filteredLeadsBase() {
   const q = state.filters.query.toLowerCase().trim();
@@ -335,6 +377,26 @@ function switchAuthMode(mode) {
   $("authSwitchBtn").textContent = mode === "login" ? "Crear cuenta" : "Ya tengo cuenta";
 }
 
+async function ensureActiveSession() {
+  const { data, error } = await db.auth.getSession();
+  if (error || !data?.session?.user) {
+    console.error(error || "No active session");
+    state.session = null;
+    state.user = null;
+    if (state.channel) {
+      db.removeChannel(state.channel);
+      state.channel = null;
+    }
+    $("appView").classList.add("hidden");
+    $("loginView").classList.remove("hidden");
+    showToast("Tu sesión venció. Volvé a ingresar.");
+    return false;
+  }
+  state.session = data.session;
+  state.user = data.session.user;
+  return true;
+}
+
 async function handleAuth(session) {
   if (session?.user) {
     state.session = session;
@@ -369,14 +431,26 @@ function subscribeRealtime() {
 }
 
 async function patchLead(id, patch) {
-  const { error } = await db.from("leads").update(patch).eq("id", id);
+  if (!(await ensureActiveSession())) return;
+  const prevLeads = [...state.leads];
+  state.leads = state.leads.map(l => l.id === id ? { ...l, ...patch } : l);
+  render();
+  const { error, data } = await db.from("leads").update(patch).eq("id", id).select().single();
   if (error) {
     console.error(error);
+    state.leads = prevLeads;
+    render();
     showToast("No pude actualizar el lead.");
+    return;
   }
+  if (data) {
+    state.leads = state.leads.map(l => l.id === id ? data : l);
+  }
+  render();
 }
 
 async function completeLeadTask(id) {
+  if (!(await ensureActiveSession())) return;
   const lead = state.leads.find(l => l.id === id);
   if (!lead) return;
   const currentTaskId = taskIdForLead(lead);
@@ -389,18 +463,44 @@ async function completeLeadTask(id) {
 
   let nextStreak = state.profile?.streak || 0;
   const lastDone = state.profile?.last_task_completed_on;
-  if (!lastDone) {
-    nextStreak = 1;
-  } else {
+  if (!lastDone) nextStreak = 1;
+  else {
     const gap = diffDays(lastDone, todayStr());
-    if (gap === 0) {
-      nextStreak = state.profile?.streak || 1;
-    } else if (gap === 1) {
-      nextStreak = (state.profile?.streak || 0) + 1;
-    } else {
-      nextStreak = 1;
-    }
+    if (gap === 0) nextStreak = state.profile?.streak || 1;
+    else if (gap === 1) nextStreak = (state.profile?.streak || 0) + 1;
+    else nextStreak = 1;
   }
+
+  const prevLeads = [...state.leads];
+  const prevTasks = [...state.tasks];
+  const prevProfile = state.profile ? { ...state.profile } : null;
+  const tempTask = {
+    id: `temp-task-${Date.now()}`,
+    user_id: state.user.id,
+    lead_id: lead.id,
+    title: `Recontactar a ${lead.empresa}`,
+    due_date: nextDate,
+    notes: nextAction(lead),
+    source: "gestion",
+    completed: false
+  };
+
+  state.leads = state.leads.map(l => l.id === id ? {
+    ...l,
+    ultimo_contacto: todayStr(),
+    proximo_seguimiento: nextDate,
+    estado: l.estado === "Nuevo" ? "Contactado" : l.estado,
+    last_rewarded_task_id: currentTaskId,
+    task_version: (l.task_version || 1) + 1
+  } : l);
+  state.tasks = [tempTask, ...state.tasks];
+  state.profile = {
+    ...(state.profile || {}),
+    xp: (state.profile?.xp || 0) + pts,
+    streak: nextStreak,
+    last_task_completed_on: todayStr()
+  };
+  render();
 
   const leadUpdate = await db.from("leads").update({
     ultimo_contacto: todayStr(),
@@ -408,10 +508,13 @@ async function completeLeadTask(id) {
     estado: lead.estado === "Nuevo" ? "Contactado" : lead.estado,
     last_rewarded_task_id: currentTaskId,
     task_version: (lead.task_version || 1) + 1
-  }).eq("id", id);
-
+  }).eq("id", id).select().single();
   if (leadUpdate.error) {
     console.error(leadUpdate.error);
+    state.leads = prevLeads;
+    state.tasks = prevTasks;
+    state.profile = prevProfile;
+    render();
     return showToast("No pude completar la gestión.");
   }
 
@@ -422,21 +525,28 @@ async function completeLeadTask(id) {
     due_date: nextDate,
     notes: nextAction(lead),
     source: "gestion"
-  });
-  if (taskInsert.error) console.error(taskInsert.error);
+  }).select().single();
+  if (taskInsert.error) {
+    console.error(taskInsert.error);
+  } else if (taskInsert.data) {
+    state.tasks = state.tasks.map(t => t.id === tempTask.id ? taskInsert.data : t);
+  }
 
   await updateProfile({
-    xp: (state.profile?.xp || 0) + pts,
+    xp: (prevProfile?.xp || 0) + pts,
     streak: nextStreak,
     last_task_completed_on: todayStr()
   });
+  if (leadUpdate.data) {
+    state.leads = state.leads.map(l => l.id === id ? leadUpdate.data : l);
+  }
 
   playSuccessSound();
   if ("Notification" in window && Notification.permission === "granted") {
     new Notification("Gestión completada", { body: `${lead.empresa}: +${pts} XP. Nueva tarea para ${nextDate}.` });
   }
   showToast(`Gestión completada. +${pts} XP. Nueva tarea para ${nextDate}.`);
-  await fetchAllData();
+  render();
 }
 window.completeLeadTask = completeLeadTask;
 
@@ -456,32 +566,54 @@ async function toggleCoachTask(id, done) {
 }
 
 async function createManualTask() {
+  if (!(await ensureActiveSession())) return;
   const title = $("taskTitleInput").value.trim();
   const dueDate = $("taskDateInput").value;
   const notes = $("taskNoteInput").value.trim();
   if (!title) return showToast("La tarea necesita un título.");
-  const { error } = await db.from("tasks").insert({
+  const temp = {
+    id: `temp-${Date.now()}`,
+    user_id: state.user.id,
+    title,
+    due_date: dueDate || null,
+    notes,
+    source: "manual",
+    completed: false
+  };
+  state.tasks = [temp, ...state.tasks];
+  $("taskTitleInput").value = "";
+  $("taskDateInput").value = "";
+  $("taskNoteInput").value = "";
+  render();
+  const { data, error } = await db.from("tasks").insert({
     user_id: state.user.id,
     title,
     due_date: dueDate || null,
     notes,
     source: "manual"
-  });
+  }).select().single();
   if (error) {
     console.error(error);
+    state.tasks = state.tasks.filter(t => t.id !== temp.id);
+    render();
     return showToast("No pude crear la tarea.");
   }
-  $("taskTitleInput").value = "";
-  $("taskDateInput").value = "";
-  $("taskNoteInput").value = "";
+  state.tasks = state.tasks.map(t => t.id === temp.id ? data : t);
   showToast("Tarea creada.");
+  render();
 }
 window.createManualTask = createManualTask;
 
 async function completeTaskItem(id) {
+  if (!(await ensureActiveSession())) return;
+  const prevTasks = [...state.tasks];
+  state.tasks = state.tasks.filter(t => t.id !== id);
+  render();
   const { error } = await db.from("tasks").update({ completed: true, completed_at: new Date().toISOString() }).eq("id", id);
   if (error) {
     console.error(error);
+    state.tasks = prevTasks;
+    render();
     return showToast("No pude completar la tarea.");
   }
   showToast("Tarea completada.");
@@ -489,9 +621,15 @@ async function completeTaskItem(id) {
 window.completeTaskItem = completeTaskItem;
 
 async function deleteTaskItem(id) {
+  if (!(await ensureActiveSession())) return;
+  const prevTasks = [...state.tasks];
+  state.tasks = state.tasks.filter(t => t.id !== id);
+  render();
   const { error } = await db.from("tasks").delete().eq("id", id);
   if (error) {
     console.error(error);
+    state.tasks = prevTasks;
+    render();
     return showToast("No pude borrar la tarea.");
   }
 }
@@ -550,11 +688,13 @@ async function importExcel(file) {
       return showToast("No pude importar el Excel.");
     }
     showToast(`Se importaron ${mapped.length} contactos.`);
+    await fetchAllData();
   };
   reader.readAsArrayBuffer(file);
 }
 
 async function saveModal() {
+  if (!(await ensureActiveSession())) return;
   const payload = {
     empresa: $("mEmpresa").value.trim(),
     contacto: $("mContacto").value.trim(),
@@ -579,20 +719,37 @@ async function saveModal() {
   if (!payload.empresa) return showToast("La empresa es obligatoria.");
 
   if (state.modalMode === "create") {
-    const { error } = await db.from("leads").insert({ user_id: state.user.id, ...payload });
+    const temp = { id: `temp-${Date.now()}`, user_id: state.user.id, ...payload };
+    state.leads = [temp, ...state.leads];
+    state.selectedLeadId = temp.id;
+    $("modalBg").style.display = "none";
+    render();
+    const { data, error } = await db.from("leads").insert({ user_id: state.user.id, ...payload }).select().single();
     if (error) {
       console.error(error);
+      state.leads = state.leads.filter(l => l.id !== temp.id);
+      state.selectedLeadId = state.leads[0]?.id || null;
+      render();
       return showToast("No pude crear el lead.");
     }
+    state.leads = state.leads.map(l => l.id === temp.id ? data : l);
+    state.selectedLeadId = data.id;
   } else {
-    const { error } = await db.from("leads").update(payload).eq("id", state.editingId);
+    const prevLeads = [...state.leads];
+    state.leads = state.leads.map(l => l.id === state.editingId ? { ...l, ...payload } : l);
+    $("modalBg").style.display = "none";
+    render();
+    const { data, error } = await db.from("leads").update(payload).eq("id", state.editingId).select().single();
     if (error) {
       console.error(error);
+      state.leads = prevLeads;
+      render();
       return showToast("No pude actualizar el lead.");
     }
+    state.leads = state.leads.map(l => l.id === state.editingId ? data : l);
   }
-  $("modalBg").style.display = "none";
   showToast("Lead guardado.");
+  render();
 }
 
 function openModal(mode) {
@@ -631,18 +788,27 @@ function openModal(mode) {
 }
 
 async function deleteSelectedLead() {
+  if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
   if (!confirm(`¿Querés borrar a ${lead.empresa}?`)) return;
+  const prevLeads = [...state.leads];
+  state.leads = state.leads.filter(l => l.id !== lead.id);
+  state.selectedLeadId = state.leads[0]?.id || null;
+  render();
   const { error } = await db.from("leads").delete().eq("id", lead.id);
   if (error) {
     console.error(error);
+    state.leads = prevLeads;
+    state.selectedLeadId = lead.id;
+    render();
     return showToast("No pude borrar el lead.");
   }
   showToast("Lead eliminado.");
 }
 
 async function toggleFavoriteSelected() {
+  if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
   await patchLead(lead.id, { favorita: !lead.favorita });
@@ -751,7 +917,7 @@ function render() {
     $("recontact15Btn").onclick = () => patchLead(lead.id, { proximo_seguimiento: addBusinessDays(todayStr(), 15), task_version: (lead.task_version || 1) + 1 });
   }
 
-  const queue = smartQueue();
+  const queue = actionableQueue();
   $("focusGrid").innerHTML = queue.slice(0,3).map((l,i)=>`
     <div class="focus-card">
       <div class="muted tiny">Focus ${i+1}</div>
@@ -765,7 +931,7 @@ function render() {
     </div>
   `).join("") || `<div class="empty">No hay foco sugerido.</div>`;
 
-  const agendaItems = queue.filter(l => ["vencido","hoy","pronto"].includes(dueLevel(l)) || l.estado === "Nuevo" || !l.telefono).slice(0,20);
+  const agendaItems = actionableQueue().slice(0,20);
   $("agendaList").innerHTML = agendaItems.length ? agendaItems.map((l,i)=>`
     <div class="task-card">
       <div class="row between">
@@ -797,24 +963,25 @@ function render() {
   $("tipsWrap").innerHTML = rotatingTips().map(t => `<div class="tip-card"><strong>Consejo</strong><div class="muted" style="margin-top:6px">${esc(t)}</div></div>`).join("");
 
   $("taskList").innerHTML = state.tasks.length ? state.tasks.map(t => `
-    <div class="task-card">
+    <div class="card"><div class="cardBody">
       <div class="row between">
         <div>
           <strong>${esc(t.title)}</strong>
           <div class="muted tiny" style="margin-top:4px">${esc(t.due_date || "Sin fecha")} · ${t.source === "manual" ? "Manual" : "Gestión"}</div>
         </div>
-        <span class="badge">${t.source === "manual" ? "Manual" : "Gestión"}</span>
+        ${taskDueBadge(t)}
       </div>
       ${t.notes ? `<div class="muted" style="margin-top:10px">${esc(t.notes)}</div>` : ""}
       <div class="row" style="margin-top:14px">
-        <button class="btn ok small" onclick="completeTaskItem('${t.id}')">Completar</button>
-        <button class="btn danger small" onclick="deleteTaskItem('${t.id}')">Borrar</button>
+        <button class="btn ok" onclick="completeTaskItem('${t.id}')">Completar</button>
+        <button class="btn danger" onclick="deleteTaskItem('${t.id}')">Borrar</button>
       </div>
-    </div>
+    </div></div>
   `).join("") : `<div class="empty">Todavía no hay tareas.</div>`;
 
   document.querySelectorAll(".bottomnav button").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === state.activeTab));
   ["inicio","leads","agenda","coach","tareas"].forEach(tab => $("tab-"+tab).classList.toggle("hidden", state.activeTab !== tab));
+  notifyDueTasks();
 }
 
 function initEvents() {
