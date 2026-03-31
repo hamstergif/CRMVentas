@@ -198,8 +198,14 @@ function smartQueue() {
 
 function actionableQueue() {
   return smartQueue().filter(l => {
+    const completedToday = l.ultimo_contacto === todayStr() && !!l.last_rewarded_task_id;
+    if (completedToday) return false;
+
     const due = dueLevel(l);
-    return ["vencido", "hoy", "pronto"].includes(due) || l.estado === "Nuevo" || l.estado === "Por contactar" || !l.telefono;
+    return ["vencido", "hoy", "pronto"].includes(due)
+      || l.estado === "Nuevo"
+      || l.estado === "Por contactar"
+      || !l.telefono;
   });
 }
 
@@ -397,6 +403,35 @@ async function ensureActiveSession() {
   return true;
 }
 
+
+async function refreshSessionIfNeeded() {
+  const { data, error } = await db.auth.getSession();
+  if (error || !data?.session?.user) {
+    throw new Error("Sin sesión activa");
+  }
+  state.session = data.session;
+  state.user = data.session.user;
+  return data.session;
+}
+
+function updateStreakOnTaskCompletion() {
+  const today = todayStr();
+  const lastDone = state.profile?.last_task_completed_on;
+
+  if (!lastDone) {
+    return 1;
+  }
+
+  const gap = diffDays(lastDone, today);
+  if (gap === 0) {
+    return state.profile?.streak || 1;
+  }
+  if (gap === 1) {
+    return Math.max(1, state.profile?.streak || 1);
+  }
+  return 1;
+}
+
 async function handleAuth(session) {
   if (session?.user) {
     state.session = session;
@@ -453,23 +488,24 @@ async function completeLeadTask(id) {
   if (!(await ensureActiveSession())) return;
   const lead = state.leads.find(l => l.id === id);
   if (!lead) return;
+
+  const missing = [];
+  if (!lead.telefono || !String(lead.telefono).trim()) missing.push("teléfono");
+  if (!lead.contacto || !String(lead.contacto).trim()) missing.push("contacto");
+  if (missing.length) {
+    showToast(`No podés completar este foco. Falta: ${missing.join(" y ")}.`);
+    return;
+  }
+
   const currentTaskId = taskIdForLead(lead);
   if (lead.last_rewarded_task_id === currentTaskId) {
     showToast("Esa tarea ya fue completada. Ya no da recompensas.");
     return;
   }
+
   const pts = taskReward(lead);
   const nextDate = addBusinessDays(todayStr(), 15);
-
-  let nextStreak = state.profile?.streak || 0;
-  const lastDone = state.profile?.last_task_completed_on;
-  if (!lastDone) nextStreak = 1;
-  else {
-    const gap = diffDays(lastDone, todayStr());
-    if (gap === 0) nextStreak = state.profile?.streak || 1;
-    else if (gap === 1) nextStreak = (state.profile?.streak || 0) + 1;
-    else nextStreak = 1;
-  }
+  const nextStreak = updateStreakOnTaskCompletion();
 
   const prevLeads = [...state.leads];
   const prevTasks = [...state.tasks];
@@ -537,6 +573,7 @@ async function completeLeadTask(id) {
     streak: nextStreak,
     last_task_completed_on: todayStr()
   });
+
   if (leadUpdate.data) {
     state.leads = state.leads.map(l => l.id === id ? leadUpdate.data : l);
   }
@@ -1032,6 +1069,21 @@ async function start() {
     if (!state.user) return;
     render();
   }, 60000);
+
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState === "visible" && state.user) {
+      try {
+        await refreshSessionIfNeeded();
+        await fetchAllData();
+        render();
+      } catch (e) {
+        console.error(e);
+        showToast("La sesión se perdió. Volvé a ingresar.");
+        $("appView").classList.add("hidden");
+        $("loginView").classList.remove("hidden");
+      }
+    }
+  });
 }
 
 start();

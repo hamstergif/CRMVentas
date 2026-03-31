@@ -40,3 +40,10 @@ Correcciones:
 - Crear/editar/borrar leads y tareas refresca al instante.
 - Las tareas muestran vencimiento.
 - Recordatorios por notificación para tareas que vencen hoy o están vencidas.
+
+
+Parche aplicado:
+- El foco desaparece al completarlo.
+- Si falta teléfono o contacto, no suma XP ni sonido y muestra error.
+- La racha no se farmea: solo se mantiene por día.
+- Revalida sesión al volver de AFK.
