@@ -43,6 +43,48 @@ const state = {
   completedFocusKeys: []
 };
 
+let hiddenAt = null;
+let lastInteractionAt = Date.now();
+const HIDDEN_RELOAD_MS = 20000;
+const IDLE_RELOAD_MS = 8 * 60 * 1000;
+
+function markActivity() {
+  lastInteractionAt = Date.now();
+}
+
+function hardReloadApp(reason = "La app se reanudó después de estar inactiva. Recargando...") {
+  try {
+    sessionStorage.setItem("crm-sync-last-reload-reason", reason);
+  } catch (e) {}
+  window.location.reload();
+}
+
+function shouldHardReloadAfterIdle() {
+  const now = Date.now();
+  const tooLongHidden = hiddenAt && (now - hiddenAt > HIDDEN_RELOAD_MS);
+  const tooLongIdle = now - lastInteractionAt > IDLE_RELOAD_MS;
+  return !!(tooLongHidden || tooLongIdle);
+}
+
+function guardClientAlive() {
+  if (shouldHardReloadAfterIdle()) {
+    hardReloadApp();
+    return false;
+  }
+  return true;
+}
+
+async function guardedAction(action) {
+  if (!guardClientAlive()) return;
+  try {
+    return await action();
+  } catch (e) {
+    console.error(e);
+    hardReloadApp("La app se desincronizó. Recargando...");
+  }
+}
+
+
 function esc(s) {
   return String(s ?? "")
     .replaceAll("&","&amp;")
@@ -515,6 +557,7 @@ function subscribeRealtime() {
 }
 
 async function patchLead(id, patch) {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevLeads = [...state.leads];
   state.leads = state.leads.map(l => l.id === id ? { ...l, ...patch } : l);
@@ -534,6 +577,7 @@ async function patchLead(id, patch) {
 }
 
 async function completeLeadTask(id) {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = state.leads.find(l => l.id === id);
   if (!lead) return;
@@ -660,6 +704,7 @@ async function toggleCoachTask(id, done) {
 }
 
 async function createManualTask() {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const title = $("taskTitleInput").value.trim();
   const dueDate = $("taskDateInput").value;
@@ -699,6 +744,7 @@ async function createManualTask() {
 window.createManualTask = createManualTask;
 
 async function completeTaskItem(id) {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
@@ -715,6 +761,7 @@ async function completeTaskItem(id) {
 window.completeTaskItem = completeTaskItem;
 
 async function deleteTaskItem(id) {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
@@ -744,6 +791,7 @@ function exportExcel() {
 }
 
 async function importExcel(file) {
+  if (!guardClientAlive()) return;
   const reader = new FileReader();
   reader.onload = async (e) => {
     const data = new Uint8Array(e.target.result);
@@ -788,6 +836,7 @@ async function importExcel(file) {
 }
 
 async function saveModal() {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const payload = {
     empresa: $("mEmpresa").value.trim(),
@@ -882,6 +931,7 @@ function openModal(mode) {
 }
 
 async function deleteSelectedLead() {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
@@ -902,6 +952,7 @@ async function deleteSelectedLead() {
 }
 
 async function toggleFavoriteSelected() {
+  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
@@ -1079,23 +1130,23 @@ function render() {
 }
 
 function initEvents() {
-  $("authPrimaryBtn").onclick = () => state.authMode === "login" ? login() : signup();
+  $("authPrimaryBtn").onclick = () => guardedAction(() => state.authMode === "login" ? login() : signup());
   $("authSwitchBtn").onclick = () => switchAuthMode(state.authMode === "login" ? "signup" : "login");
-  $("logoutBtn").onclick = logout;
-  $("newLeadBtn").onclick = () => openModal("create");
-  $("editLeadBtn").onclick = () => { if (selectedLead()) openModal("edit"); };
-  $("favLeadBtn").onclick = toggleFavoriteSelected;
-  $("deleteLeadBtn").onclick = deleteSelectedLead;
+  $("logoutBtn").onclick = () => guardedAction(() => logout());
+  $("newLeadBtn").onclick = () => guardedAction(() => openModal("create"));
+  $("editLeadBtn").onclick = () => guardedAction(() => { if (selectedLead()) openModal("edit"); });
+  $("favLeadBtn").onclick = () => guardedAction(() => toggleFavoriteSelected());
+  $("deleteLeadBtn").onclick = () => guardedAction(() => deleteSelectedLead());
   $("closeModalBtn").onclick = () => $("modalBg").style.display = "none";
   $("cancelModalBtn").onclick = () => $("modalBg").style.display = "none";
-  $("saveModalBtn").onclick = saveModal;
-  $("importBtn").onclick = () => $("excelInput").click();
+  $("saveModalBtn").onclick = () => guardedAction(() => saveModal());
+  $("importBtn").onclick = () => guardedAction(() => $("excelInput").click());
   $("excelInput").onchange = (e) => {
     if (e.target.files[0]) importExcel(e.target.files[0]);
     e.target.value = "";
   };
-  $("exportBtn").onclick = exportExcel;
-  $("notifyBtn").onclick = async () => {
+  $("exportBtn").onclick = () => guardedAction(() => exportExcel());
+  $("notifyBtn").onclick = async () => guardedAction(async () => {
     if (!("Notification" in window)) return showToast("Tu navegador no soporta notificaciones.");
     if (Notification.permission === "granted") {
       new Notification("CRM activo", { body: `Tenés ${metrics().due} seguimientos importantes para hoy.` });
@@ -1103,16 +1154,16 @@ function initEvents() {
       const permission = await Notification.requestPermission();
       if (permission === "granted") new Notification("Notificaciones activadas", { body: "Te voy a recordar seguimientos y tareas pendientes." });
     }
-  };
-  $("searchInput").oninput = (e) => { state.filters.query = e.target.value; window.__metricMode = ""; render(); };
-  $("filterProvincia").onchange = (e) => { state.filters.provincia = e.target.value; window.__metricMode = ""; render(); };
-  $("filterRubro").onchange = (e) => { state.filters.rubro = e.target.value; window.__metricMode = ""; render(); };
-  $("filterEstado").onchange = (e) => { state.filters.estado = e.target.value; window.__metricMode = ""; render(); };
-  $("filterPend").onchange = (e) => { state.filters.soloPend = e.target.checked; window.__metricMode = ""; render(); };
-  $("filterFav").onchange = (e) => { state.filters.soloFav = e.target.checked; window.__metricMode = ""; render(); };
-  document.querySelectorAll(".bottomnav button").forEach(btn => btn.onclick = () => { state.activeTab = btn.dataset.tab; render(); });
+  });
+  $("searchInput").oninput = (e) => { markActivity(); state.filters.query = e.target.value; window.__metricMode = ""; render(); };
+  $("filterProvincia").onchange = (e) => { markActivity(); state.filters.provincia = e.target.value; window.__metricMode = ""; render(); };
+  $("filterRubro").onchange = (e) => { markActivity(); state.filters.rubro = e.target.value; window.__metricMode = ""; render(); };
+  $("filterEstado").onchange = (e) => { markActivity(); state.filters.estado = e.target.value; window.__metricMode = ""; render(); };
+  $("filterPend").onchange = (e) => { markActivity(); state.filters.soloPend = e.target.checked; window.__metricMode = ""; render(); };
+  $("filterFav").onchange = (e) => { markActivity(); state.filters.soloFav = e.target.checked; window.__metricMode = ""; render(); };
+  document.querySelectorAll(".bottomnav button").forEach(btn => btn.onclick = () => { markActivity(); state.activeTab = btn.dataset.tab; render(); });
   document.querySelectorAll("[data-metric]").forEach(btn => btn.onclick = () => applyMetricFilter(btn.dataset.metric));
-  $("createTaskBtn").onclick = createManualTask;
+  $("createTaskBtn").onclick = () => guardedAction(() => createManualTask());
 }
 
 async function start() {
@@ -1125,25 +1176,59 @@ async function start() {
   setInterval(async () => {
     if (!state.user) return;
     try {
-      await refreshSessionIfNeeded();
-      render();
+      if (guardClientAlive()) {
+        await refreshSessionIfNeeded();
+        render();
+      }
     } catch (e) {
       console.error(e);
     }
   }, 240000);
 
+  ["click","keydown","mousemove","touchstart","scroll"].forEach(evt => {
+    document.addEventListener(evt, markActivity, { passive: true });
+  });
+
   document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState === "visible" && state.user) {
-      try {
-        await refreshSessionIfNeeded();
-        await fetchAllData();
-        render();
-      } catch (e) {
-        console.error(e);
-        handleSessionExpired();
-      }
+    if (document.visibilityState === "hidden") {
+      hiddenAt = Date.now();
+      return;
+    }
+    markActivity();
+    if (!state.user) return;
+    if (shouldHardReloadAfterIdle()) {
+      hardReloadApp();
+      return;
+    }
+    try {
+      await refreshSessionIfNeeded();
+      await fetchAllData();
+      render();
+    } catch (e) {
+      console.error(e);
+      hardReloadApp("La sesión se perdió. Recargando...");
     }
   });
+
+  window.addEventListener("focus", () => {
+    markActivity();
+    if (state.user && shouldHardReloadAfterIdle()) {
+      hardReloadApp();
+    }
+  });
+
+  window.addEventListener("pageshow", () => {
+    markActivity();
+    if (state.user && shouldHardReloadAfterIdle()) {
+      hardReloadApp();
+    }
+  });
+
+  const reloadReason = sessionStorage.getItem("crm-sync-last-reload-reason");
+  if (reloadReason) {
+    sessionStorage.removeItem("crm-sync-last-reload-reason");
+    showToast(reloadReason);
+  }
 }
 
 start();

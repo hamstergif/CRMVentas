@@ -47,3 +47,9 @@ Parche aplicado:
 - Si falta teléfono o contacto, no suma XP ni sonido y muestra error.
 - La racha no se farmea: solo se mantiene por día.
 - Revalida sesión al volver de AFK.
+
+
+Parche v5:
+- Hard reload al volver de AFK o pestaña dormida.
+- Guardas de cliente antes de acciones críticas.
+- Si la app entra en estado zombie, se recarga sola.
