@@ -39,7 +39,8 @@ const state = {
   filters: { query:"", provincia:"Todas", rubro:"Todos", estado:"Todos", soloPend:false, soloFav:false },
   modalMode: "create",
   editingId: null,
-  channel: null
+  channel: null,
+  completedFocusKeys: []
 };
 
 function esc(s) {
@@ -51,12 +52,13 @@ function esc(s) {
     .replaceAll("'","&#39;");
 }
 
-function showToast(msg) {
+function showToast(msg, type = "ok") {
   const t = $("toast");
   t.textContent = msg;
+  t.className = `toast ${type}`;
   t.style.display = "block";
   clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => t.style.display = "none", 2800);
+  window.__toastTimer = setTimeout(() => t.style.display = "none", 3200);
 }
 
 function todayStr() {
@@ -197,7 +199,11 @@ function smartQueue() {
 }
 
 function actionableQueue() {
+  const hidden = state.completedFocusKeys || [];
   return smartQueue().filter(l => {
+    const currentKey = taskIdForLead(l);
+    if (hidden.includes(currentKey)) return false;
+
     const completedToday = l.ultimo_contacto === todayStr() && !!l.last_rewarded_task_id;
     if (completedToday) return false;
 
@@ -259,6 +265,22 @@ function playSuccessSound() {
     o1.connect(g); o2.connect(g); g.connect(ctx.destination);
     o1.start(); o2.start(ctx.currentTime + .04);
     o1.stop(ctx.currentTime + .18); o2.stop(ctx.currentTime + .22);
+  } catch (e) {}
+}
+
+function playErrorSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o1 = ctx.createOscillator();
+    const g = ctx.createGain();
+    o1.type = "sawtooth";
+    o1.frequency.setValueAtTime(280, ctx.currentTime);
+    o1.frequency.exponentialRampToValueAtTime(180, ctx.currentTime + 0.22);
+    g.gain.setValueAtTime(.001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(.12, ctx.currentTime + .02);
+    g.gain.exponentialRampToValueAtTime(.001, ctx.currentTime + .25);
+    o1.connect(g); g.connect(ctx.destination);
+    o1.start(); o1.stop(ctx.currentTime + .25);
   } catch (e) {}
 }
 
@@ -383,35 +405,51 @@ function switchAuthMode(mode) {
   $("authSwitchBtn").textContent = mode === "login" ? "Crear cuenta" : "Ya tengo cuenta";
 }
 
-async function ensureActiveSession() {
-  const { data, error } = await db.auth.getSession();
-  if (error || !data?.session?.user) {
-    console.error(error || "No active session");
-    state.session = null;
-    state.user = null;
-    if (state.channel) {
-      db.removeChannel(state.channel);
-      state.channel = null;
-    }
-    $("appView").classList.add("hidden");
-    $("loginView").classList.remove("hidden");
-    showToast("Tu sesión venció. Volvé a ingresar.");
-    return false;
+function handleSessionExpired() {
+  state.session = null;
+  state.user = null;
+  state.profile = null;
+  if (state.channel) {
+    db.removeChannel(state.channel);
+    state.channel = null;
   }
-  state.session = data.session;
-  state.user = data.session.user;
-  return true;
+  $("appView").classList.add("hidden");
+  $("loginView").classList.remove("hidden");
+  showToast("Tu sesión venció. Volvé a ingresar.", "error");
 }
 
-
 async function refreshSessionIfNeeded() {
-  const { data, error } = await db.auth.getSession();
-  if (error || !data?.session?.user) {
-    throw new Error("Sin sesión activa");
+  let sessionRes = await db.auth.getSession();
+  let session = sessionRes.data?.session || null;
+  if (!session) {
+    const refreshed = await db.auth.refreshSession();
+    session = refreshed.data?.session || null;
   }
-  state.session = data.session;
-  state.user = data.session.user;
-  return data.session;
+  if (!session) throw new Error("Sin sesión activa");
+
+  const userRes = await db.auth.getUser();
+  if (userRes.error || !userRes.data?.user) {
+    const refreshed = await db.auth.refreshSession();
+    if (!refreshed.data?.session?.user) throw new Error("Sin sesión activa");
+    state.session = refreshed.data.session;
+    state.user = refreshed.data.session.user;
+    return refreshed.data.session;
+  }
+
+  state.session = session;
+  state.user = session.user;
+  return session;
+}
+
+async function ensureActiveSession() {
+  try {
+    await refreshSessionIfNeeded();
+    return true;
+  } catch (e) {
+    console.error(e);
+    handleSessionExpired();
+    return false;
+  }
 }
 
 function updateStreakOnTaskCompletion() {
@@ -430,6 +468,17 @@ function updateStreakOnTaskCompletion() {
     return Math.max(1, state.profile?.streak || 1);
   }
   return 1;
+}
+
+async function withAuthRetry(fn) {
+  let res = await fn();
+  const msg = res?.error?.message || "";
+  if (res?.error && /jwt|token|session|refresh/i.test(msg)) {
+    const ok = await ensureActiveSession();
+    if (!ok) return res;
+    res = await fn();
+  }
+  return res;
 }
 
 async function handleAuth(session) {
@@ -470,7 +519,7 @@ async function patchLead(id, patch) {
   const prevLeads = [...state.leads];
   state.leads = state.leads.map(l => l.id === id ? { ...l, ...patch } : l);
   render();
-  const { error, data } = await db.from("leads").update(patch).eq("id", id).select().single();
+  const { error, data } = await withAuthRetry(() => db.from("leads").update(patch).eq("id", id).select().single());
   if (error) {
     console.error(error);
     state.leads = prevLeads;
@@ -490,26 +539,34 @@ async function completeLeadTask(id) {
   if (!lead) return;
 
   const missing = [];
-  if (!lead.telefono || !String(lead.telefono).trim()) missing.push("teléfono");
-  if (!lead.contacto || !String(lead.contacto).trim()) missing.push("contacto");
+  const digits = String(lead.telefono || "").replace(/\D/g, "");
+  const contactVal = String(lead.contacto || "").trim();
+  if (!digits || digits.length < 6) missing.push("teléfono válido");
+  if (!contactVal || contactVal === "." || contactVal === "-" || contactVal.length < 2) missing.push("contacto válido");
+
   if (missing.length) {
-    showToast(`No podés completar este foco. Falta: ${missing.join(" y ")}.`);
+    playErrorSound();
+    showToast(`No podés completar este foco. Falta: ${missing.join(" y ")}.`, "error");
     return;
   }
 
   const currentTaskId = taskIdForLead(lead);
   if (lead.last_rewarded_task_id === currentTaskId) {
-    showToast("Esa tarea ya fue completada. Ya no da recompensas.");
+    playErrorSound();
+    showToast("Esa tarea ya fue completada. Ya no da recompensas.", "error");
     return;
   }
 
   const pts = taskReward(lead);
   const nextDate = addBusinessDays(todayStr(), 15);
   const nextStreak = updateStreakOnTaskCompletion();
+  const focusKey = currentTaskId;
 
   const prevLeads = [...state.leads];
   const prevTasks = [...state.tasks];
   const prevProfile = state.profile ? { ...state.profile } : null;
+  state.completedFocusKeys = [...new Set([...(state.completedFocusKeys || []), focusKey])];
+
   const tempTask = {
     id: `temp-task-${Date.now()}`,
     user_id: state.user.id,
@@ -538,33 +595,33 @@ async function completeLeadTask(id) {
   };
   render();
 
-  const leadUpdate = await db.from("leads").update({
+  const leadUpdate = await withAuthRetry(() => db.from("leads").update({
     ultimo_contacto: todayStr(),
     proximo_seguimiento: nextDate,
     estado: lead.estado === "Nuevo" ? "Contactado" : lead.estado,
     last_rewarded_task_id: currentTaskId,
     task_version: (lead.task_version || 1) + 1
-  }).eq("id", id).select().single();
+  }).eq("id", id).select().single());
   if (leadUpdate.error) {
     console.error(leadUpdate.error);
     state.leads = prevLeads;
     state.tasks = prevTasks;
     state.profile = prevProfile;
+    state.completedFocusKeys = (state.completedFocusKeys || []).filter(k => k !== focusKey);
     render();
-    return showToast("No pude completar la gestión.");
+    playErrorSound();
+    return showToast("No pude completar la gestión.", "error");
   }
 
-  const taskInsert = await db.from("tasks").insert({
+  const taskInsert = await withAuthRetry(() => db.from("tasks").insert({
     user_id: state.user.id,
     lead_id: lead.id,
     title: `Recontactar a ${lead.empresa}`,
     due_date: nextDate,
     notes: nextAction(lead),
     source: "gestion"
-  }).select().single();
-  if (taskInsert.error) {
-    console.error(taskInsert.error);
-  } else if (taskInsert.data) {
+  }).select().single());
+  if (!taskInsert.error && taskInsert.data) {
     state.tasks = state.tasks.map(t => t.id === tempTask.id ? taskInsert.data : t);
   }
 
@@ -622,13 +679,13 @@ async function createManualTask() {
   $("taskDateInput").value = "";
   $("taskNoteInput").value = "";
   render();
-  const { data, error } = await db.from("tasks").insert({
+  const { data, error } = await withAuthRetry(() => db.from("tasks").insert({
     user_id: state.user.id,
     title,
     due_date: dueDate || null,
     notes,
     source: "manual"
-  }).select().single();
+  }).select().single());
   if (error) {
     console.error(error);
     state.tasks = state.tasks.filter(t => t.id !== temp.id);
@@ -646,7 +703,7 @@ async function completeTaskItem(id) {
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
   render();
-  const { error } = await db.from("tasks").update({ completed: true, completed_at: new Date().toISOString() }).eq("id", id);
+  const { error } = await withAuthRetry(() => db.from("tasks").update({ completed: true, completed_at: new Date().toISOString() }).eq("id", id));
   if (error) {
     console.error(error);
     state.tasks = prevTasks;
@@ -662,7 +719,7 @@ async function deleteTaskItem(id) {
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
   render();
-  const { error } = await db.from("tasks").delete().eq("id", id);
+  const { error } = await withAuthRetry(() => db.from("tasks").delete().eq("id", id));
   if (error) {
     console.error(error);
     state.tasks = prevTasks;
@@ -719,7 +776,7 @@ async function importExcel(file) {
     })).filter(x => x.empresa);
 
     if (!mapped.length) return showToast("No encontré filas válidas.");
-    const { error } = await db.from("leads").insert(mapped);
+    const { error } = await withAuthRetry(() => db.from("leads").insert(mapped));
     if (error) {
       console.error(error);
       return showToast("No pude importar el Excel.");
@@ -761,7 +818,7 @@ async function saveModal() {
     state.selectedLeadId = temp.id;
     $("modalBg").style.display = "none";
     render();
-    const { data, error } = await db.from("leads").insert({ user_id: state.user.id, ...payload }).select().single();
+    const { data, error } = await withAuthRetry(() => db.from("leads").insert({ user_id: state.user.id, ...payload }).select().single());
     if (error) {
       console.error(error);
       state.leads = state.leads.filter(l => l.id !== temp.id);
@@ -776,7 +833,7 @@ async function saveModal() {
     state.leads = state.leads.map(l => l.id === state.editingId ? { ...l, ...payload } : l);
     $("modalBg").style.display = "none";
     render();
-    const { data, error } = await db.from("leads").update(payload).eq("id", state.editingId).select().single();
+    const { data, error } = await withAuthRetry(() => db.from("leads").update(payload).eq("id", state.editingId).select().single());
     if (error) {
       console.error(error);
       state.leads = prevLeads;
@@ -833,7 +890,7 @@ async function deleteSelectedLead() {
   state.leads = state.leads.filter(l => l.id !== lead.id);
   state.selectedLeadId = state.leads[0]?.id || null;
   render();
-  const { error } = await db.from("leads").delete().eq("id", lead.id);
+  const { error } = await withAuthRetry(() => db.from("leads").delete().eq("id", lead.id));
   if (error) {
     console.error(error);
     state.leads = prevLeads;
@@ -1065,10 +1122,15 @@ async function start() {
   db.auth.onAuthStateChange(async (_event, session) => {
     await handleAuth(session);
   });
-  setInterval(() => {
+  setInterval(async () => {
     if (!state.user) return;
-    render();
-  }, 60000);
+    try {
+      await refreshSessionIfNeeded();
+      render();
+    } catch (e) {
+      console.error(e);
+    }
+  }, 240000);
 
   document.addEventListener("visibilitychange", async () => {
     if (document.visibilityState === "visible" && state.user) {
@@ -1078,9 +1140,7 @@ async function start() {
         render();
       } catch (e) {
         console.error(e);
-        showToast("La sesión se perdió. Volvé a ingresar.");
-        $("appView").classList.add("hidden");
-        $("loginView").classList.remove("hidden");
+        handleSessionExpired();
       }
     }
   });

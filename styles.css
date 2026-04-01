@@ -47,7 +47,7 @@ button.btn.small{padding:8px 10px;border-radius:12px;font-size:13px}
 .bottomnav{position:fixed;left:50%;transform:translateX(-50%);bottom:10px;width:min(920px,calc(100% - 24px));display:grid;grid-template-columns:repeat(5,1fr);gap:8px;padding:10px;border:1px solid var(--border);border-radius:18px;background:rgba(255,255,255,.96);backdrop-filter:blur(10px);box-shadow:var(--shadow);z-index:30}
 .bottomnav button{padding:12px 10px;border:1px solid transparent;background:transparent;border-radius:14px;color:var(--muted)}
 .bottomnav button.active{background:var(--primary);color:#fff}
-.toast{position:fixed;top:16px;right:16px;background:var(--ok-bg);color:var(--ok);border:1px solid #a7f3d0;padding:12px 14px;border-radius:14px;display:none;z-index:100}
+.toast{position:fixed;top:16px;right:16px;padding:12px 14px;border-radius:14px;display:none;z-index:100}.toast.ok{background:var(--ok-bg);color:var(--ok);border:1px solid #a7f3d0}.toast.error{background:var(--danger-bg);color:var(--danger);border:1px solid #fecaca}
 .modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.36);display:none;place-items:center;padding:20px;z-index:50}
 .modal{background:#fff;width:min(1180px,100%);max-height:90vh;overflow:auto;border-radius:22px;border:1px solid var(--border);box-shadow:var(--shadow)}
 .empty{padding:18px;border:1px dashed #cbd5e1;border-radius:18px;text-align:center;color:var(--muted);background:#fff}
