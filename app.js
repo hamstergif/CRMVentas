@@ -26,6 +26,8 @@ const TIERS = [
 ];
 
 const $ = (id) => document.getElementById(id);
+const LEADS_PAGE_SIZE = 1000;
+const IMPORT_BATCH_SIZE = 500;
 const state = {
   authMode: "login",
   session: null,
@@ -42,48 +44,6 @@ const state = {
   channel: null,
   completedFocusKeys: []
 };
-
-let hiddenAt = null;
-let lastInteractionAt = Date.now();
-const HIDDEN_RELOAD_MS = 20000;
-const IDLE_RELOAD_MS = 8 * 60 * 1000;
-
-function markActivity() {
-  lastInteractionAt = Date.now();
-}
-
-function hardReloadApp(reason = "La app se reanudó después de estar inactiva. Recargando...") {
-  try {
-    sessionStorage.setItem("crm-sync-last-reload-reason", reason);
-  } catch (e) {}
-  window.location.reload();
-}
-
-function shouldHardReloadAfterIdle() {
-  const now = Date.now();
-  const tooLongHidden = hiddenAt && (now - hiddenAt > HIDDEN_RELOAD_MS);
-  const tooLongIdle = now - lastInteractionAt > IDLE_RELOAD_MS;
-  return !!(tooLongHidden || tooLongIdle);
-}
-
-function guardClientAlive() {
-  if (shouldHardReloadAfterIdle()) {
-    hardReloadApp();
-    return false;
-  }
-  return true;
-}
-
-async function guardedAction(action) {
-  if (!guardClientAlive()) return;
-  try {
-    return await action();
-  } catch (e) {
-    console.error(e);
-    hardReloadApp("La app se desincronizó. Recargando...");
-  }
-}
-
 
 function esc(s) {
   return String(s ?? "")
@@ -174,6 +134,94 @@ function nextTier() {
   return TIERS.find(t => t.min > (state.profile?.xp || 0)) || null;
 }
 
+function hasWhatsapp(lead) {
+  return !!String(lead?.telefono || "").trim();
+}
+
+function hasEmail(lead) {
+  return !!String(lead?.email || "").trim();
+}
+
+function hasDirectChannel(lead) {
+  return hasWhatsapp(lead) || hasEmail(lead);
+}
+
+function leadCompleteness(lead) {
+  const checks = [lead?.empresa, lead?.contacto, lead?.telefono, lead?.email, lead?.proximo_seguimiento, lead?.notas];
+  const completed = checks.filter(v => String(v || "").trim()).length;
+  return Math.round((completed / checks.length) * 100);
+}
+
+function progressDecayValue(profile = state.profile) {
+  const gap = diffDays(profile?.last_task_completed_on, todayStr());
+  if (gap === null || gap <= 1) return 0;
+  return Math.min(profile?.xp || 0, (gap - 1) * 18);
+}
+
+function activeXpValue(profile = state.profile) {
+  return Math.max(0, (profile?.xp || 0) - progressDecayValue(profile));
+}
+
+function leadHeat(lead) {
+  const heat = (lead.score || 0)
+    + (lead.prioridad === "Alta" ? 18 : lead.prioridad === "Media" ? 8 : 0)
+    + (dueLevel(lead) === "vencido" ? 14 : dueLevel(lead) === "hoy" ? 8 : 0);
+  if (heat >= 95) return { label: "Muy caliente", cls: "danger" };
+  if (heat >= 70) return { label: "Activa", cls: "warn" };
+  return { label: "En desarrollo", cls: "ok" };
+}
+
+function normalizeWhatsapp(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  return digits.length > 10 || digits.startsWith("54") ? digits : `54${digits.replace(/^0+/, "")}`;
+}
+
+function whatsappHref(value) {
+  const digits = normalizeWhatsapp(value);
+  return digits ? `https://wa.me/${digits}` : "";
+}
+
+function emailHref(value, lead) {
+  const email = String(value || "").trim();
+  if (!email) return "";
+  const subject = encodeURIComponent(`Consulta comex - ${lead?.empresa || "empresa"}`);
+  return `mailto:${email}?subject=${subject}`;
+}
+
+function nextAction(lead) {
+  const due = dueLevel(lead);
+  if (!lead.contacto) return "Validar quien maneja comex y cargar nombre del responsable.";
+  if (!hasDirectChannel(lead)) return "Conseguir WhatsApp o email directo del contacto de comex.";
+  if (!hasWhatsapp(lead)) return "Pedir WhatsApp directo para acelerar el seguimiento.";
+  if (!hasEmail(lead)) return "Pedir email directo para mandar presentacion o cotizacion.";
+  if (due === "vencido") return "Recontactar hoy y dejar asentado el resultado de la gestion.";
+  if (lead.estado === "Nuevo") return "Abrir conversacion corta y detectar operacion, origen y timing.";
+  if (lead.estado === "Contactado") return "Mandar propuesta concreta o pedir detalle del proximo embarque.";
+  if (lead.estado === "Cotizado") return "Retomar con argumento de cierre y opcion logistica alternativa.";
+  if (lead.estado === "Seguimiento") return "Mantener presencia con valor, novedad util y fecha siguiente.";
+  return "Actualizar la ficha y definir un siguiente paso con fecha.";
+}
+
+function taskReward(lead) {
+  let r = 15;
+  if (hasWhatsapp(lead)) r += 5;
+  if (hasEmail(lead)) r += 5;
+  if (lead.contacto) r += 5;
+  if ((lead.score || 0) >= 70) r += 10;
+  if (lead.prioridad === "Alta") r += 10;
+  if (dueLevel(lead) === "vencido") r += 5;
+  return r;
+}
+
+function currentTier() {
+  return [...TIERS].reverse().find(t => activeXpValue() >= t.min) || TIERS[0];
+}
+
+function nextTier() {
+  return TIERS.find(t => t.min > activeXpValue()) || null;
+}
+
 function taskIdForLead(lead) {
   return `${lead.id}::${lead.task_version || 1}`;
 }
@@ -219,7 +267,7 @@ function selectedLead() {
 function metrics() {
   return {
     due: state.leads.filter(l => ["vencido","hoy"].includes(dueLevel(l))).length,
-    withoutPhone: state.leads.filter(l => !l.telefono).length,
+    withoutPhone: state.leads.filter(l => !hasDirectChannel(l)).length,
     highPriority: state.leads.filter(l => l.prioridad === "Alta").length,
     contacted: state.leads.filter(l => ["Contactado","Cotizado","Seguimiento","Cliente"].includes(l.estado)).length
   };
@@ -232,7 +280,8 @@ function smartQueue() {
       urgency:
         (dueLevel(l) === "vencido" ? 50 : 0) +
         (dueLevel(l) === "hoy" ? 35 : 0) +
-        (!l.telefono ? 20 : 0) +
+        (!hasDirectChannel(l) ? 20 : 0) +
+        (!l.contacto ? 16 : 0) +
         (l.prioridad === "Alta" ? 20 : 0) +
         ((l.score || 0) / 10)
     }))
@@ -253,7 +302,8 @@ function actionableQueue() {
     return ["vencido", "hoy", "pronto"].includes(due)
       || l.estado === "Nuevo"
       || l.estado === "Por contactar"
-      || !l.telefono;
+      || !hasDirectChannel(l)
+      || !l.contacto;
   });
 }
 
@@ -261,7 +311,7 @@ function actionableQueue() {
 function filteredLeadsBase() {
   const q = state.filters.query.toLowerCase().trim();
   return state.leads.filter(l => {
-    const matchesQuery = !q || [l.empresa,l.rubro,l.provincia,l.telefono,l.origen_habitual,l.tipo_operaciones,l.localidad,l.contacto]
+    const matchesQuery = !q || [l.empresa,l.rubro,l.provincia,l.telefono,l.email,l.web,l.origen_habitual,l.tipo_operaciones,l.localidad,l.contacto,l.notas]
       .filter(Boolean).some(v => String(v).toLowerCase().includes(q));
     const matchesProv = state.filters.provincia === "Todas" || l.provincia === state.filters.provincia;
     const matchesRubro = state.filters.rubro === "Todos" || l.rubro === state.filters.rubro;
@@ -275,7 +325,7 @@ function filteredLeadsBase() {
 function filteredLeads() {
   let arr = filteredLeadsBase();
   const mode = window.__metricMode || "";
-  if (mode === "withoutPhone") arr = arr.filter(l => !l.telefono);
+  if (mode === "withoutPhone") arr = arr.filter(l => !hasDirectChannel(l));
   if (mode === "highPriority") arr = arr.filter(l => l.prioridad === "Alta");
   if (mode === "contacted") arr = arr.filter(l => ["Contactado","Cotizado","Seguimiento","Cliente"].includes(l.estado));
   return arr;
@@ -336,13 +386,54 @@ async function updateProfile(patch) {
   }
 }
 
+async function fetchPagedRows(factory, pageSize = LEADS_PAGE_SIZE) {
+  let from = 0;
+  const rows = [];
+
+  while (true) {
+    const { data, error } = await factory(from, from + pageSize - 1);
+    if (error) return { data: rows, error };
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+
+  return { data: rows, error: null };
+}
+
+async function insertLeadBatches(rows, progressLabel = "") {
+  let inserted = 0;
+
+  for (let i = 0; i < rows.length; i += IMPORT_BATCH_SIZE) {
+    const batch = rows.slice(i, i + IMPORT_BATCH_SIZE);
+    const { error } = await withAuthRetry(() => db.from("leads").insert(batch));
+    if (error) return { error, inserted };
+    inserted += batch.length;
+
+    if (progressLabel && rows.length > IMPORT_BATCH_SIZE && (inserted === rows.length || inserted % (IMPORT_BATCH_SIZE * 2) === 0)) {
+      showToast(`${progressLabel}: ${inserted}/${rows.length}`);
+    }
+  }
+
+  return { error: null, inserted };
+}
+
 async function fetchAllData() {
   await ensureTodayCoachTasks();
   const [profileRes, leadsRes, tasksRes, coachRes] = await Promise.all([
     db.from("profiles").select("*").eq("id", state.user.id).single(),
-    db.from("leads").select("*").order("created_at", { ascending: false }),
-    db.from("tasks").select("*").eq("completed", false).order("due_date", { ascending: true, nullsFirst: false }),
-    db.from("coach_tasks").select("*").eq("task_date", todayStr()).order("created_at", { ascending: true })
+    fetchPagedRows((from, to) => db.from("leads")
+      .select("*")
+      .eq("user_id", state.user.id)
+      .order("created_at", { ascending: false })
+      .range(from, to)),
+    fetchPagedRows((from, to) => db.from("tasks")
+      .select("*")
+      .eq("user_id", state.user.id)
+      .eq("completed", false)
+      .order("due_date", { ascending: true, nullsFirst: false })
+      .range(from, to)),
+    db.from("coach_tasks").select("*").eq("user_id", state.user.id).eq("task_date", todayStr()).order("created_at", { ascending: true })
   ]);
   if (profileRes.error) console.error(profileRes.error);
   if (leadsRes.error) console.error(leadsRes.error);
@@ -367,7 +458,7 @@ async function ensureProfile() {
 }
 
 async function ensureTodayCoachTasks() {
-  const { data, error } = await db.from("coach_tasks").select("id").eq("task_date", todayStr()).limit(1);
+  const { data, error } = await db.from("coach_tasks").select("id").eq("user_id", state.user.id).eq("task_date", todayStr()).limit(1);
   if (error) {
     console.error(error);
     return;
@@ -395,17 +486,17 @@ async function maybeResetStreakByMissedDays() {
 }
 
 async function syncInitialImportIfEmpty() {
-  const { count, error } = await db.from("leads").select("*", { count: "exact", head: true });
+  const { count, error } = await db.from("leads").select("*", { count: "exact", head: true }).eq("user_id", state.user.id);
   if (error) {
     console.error(error);
     return;
   }
   if ((count || 0) === 0) {
-    const batch = INITIAL_IMPORT.slice(0, 400).map(row => ({
+    const batch = INITIAL_IMPORT.map(row => ({
       ...row,
       user_id: state.user.id
     }));
-    const res = await db.from("leads").insert(batch);
+    const res = await insertLeadBatches(batch);
     if (res.error) console.error(res.error);
   }
 }
@@ -447,6 +538,57 @@ function switchAuthMode(mode) {
   $("authSwitchBtn").textContent = mode === "login" ? "Crear cuenta" : "Ya tengo cuenta";
 }
 
+async function signup() {
+  const email = $("authEmail").value.trim();
+  const password = $("authPassword").value;
+  const confirmPassword = $("authConfirmPassword").value;
+  const displayName = $("signupName").value.trim();
+  if (!email || !password || !displayName || !confirmPassword) return showToast("Completa email, contrasena y nombre.");
+  if (password.length < 6) return showToast("La contrasena debe tener al menos 6 caracteres.", "error");
+  if (password !== confirmPassword) return showToast("Las contrasenas no coinciden.", "error");
+
+  const { error } = await db.auth.signUp({
+    email,
+    password,
+    options: {
+      data: { display_name: displayName }
+    }
+  });
+  if (error) return showToast(error.message);
+  $("authPassword").value = "";
+  $("authConfirmPassword").value = "";
+  showToast("Cuenta creada. Ahora ingresa con tu email y contrasena.");
+  switchAuthMode("login");
+}
+
+async function login() {
+  const email = $("authEmail").value.trim();
+  const password = $("authPassword").value;
+  if (!email || !password) return showToast("Completa email y contrasena.");
+  const { error } = await db.auth.signInWithPassword({ email, password });
+  if (error) return showToast(error.message);
+}
+
+function switchAuthMode(mode) {
+  state.authMode = mode;
+  $("authTitle").textContent = mode === "login" ? "Ingresar" : "Crear cuenta";
+  $("signupNameWrap").classList.toggle("hidden", mode === "login");
+  $("signupConfirmWrap").classList.toggle("hidden", mode === "login");
+  $("authPrimaryBtn").textContent = mode === "login" ? "Entrar" : "Crear cuenta";
+  $("authSwitchBtn").textContent = mode === "login" ? "Crear cuenta" : "Ya tengo cuenta";
+  $("authHelper").textContent = mode === "login"
+    ? "Entra a tu base y retoma el pipeline donde lo dejaste."
+    : "Crea tu cuenta, revisa la contrasena visible y arranca con tu CRM de comex.";
+}
+
+function togglePasswordField(inputId, buttonId) {
+  const input = $(inputId);
+  const btn = $(buttonId);
+  const visible = input.type === "text";
+  input.type = visible ? "password" : "text";
+  btn.textContent = visible ? "Ver" : "Ocultar";
+}
+
 function handleSessionExpired() {
   state.session = null;
   state.user = null;
@@ -457,6 +599,7 @@ function handleSessionExpired() {
   }
   $("appView").classList.add("hidden");
   $("loginView").classList.remove("hidden");
+  switchAuthMode("login");
   showToast("Tu sesión venció. Volvé a ingresar.", "error");
 }
 
@@ -512,6 +655,18 @@ function updateStreakOnTaskCompletion() {
   return 1;
 }
 
+function updateStreakOnTaskCompletion() {
+  const today = todayStr();
+  const lastDone = state.profile?.last_task_completed_on;
+
+  if (!lastDone) return 1;
+
+  const gap = diffDays(lastDone, today);
+  if (gap === 0) return Math.max(1, state.profile?.streak || 1);
+  if (gap === 1) return Math.max(1, (state.profile?.streak || 0) + 1);
+  return 1;
+}
+
 async function withAuthRetry(fn) {
   let res = await fn();
   const msg = res?.error?.message || "";
@@ -543,12 +698,13 @@ async function handleAuth(session) {
     }
     $("appView").classList.add("hidden");
     $("loginView").classList.remove("hidden");
+    switchAuthMode("login");
   }
 }
 
 function subscribeRealtime() {
   if (state.channel) return;
-  state.channel = db.channel("crm-sync")
+  state.channel = db.channel(`crm-sync-${state.user.id}`)
     .on("postgres_changes", { event: "*", schema: "public", table: "leads", filter: `user_id=eq.${state.user.id}` }, fetchAllData)
     .on("postgres_changes", { event: "*", schema: "public", table: "tasks", filter: `user_id=eq.${state.user.id}` }, fetchAllData)
     .on("postgres_changes", { event: "*", schema: "public", table: "coach_tasks", filter: `user_id=eq.${state.user.id}` }, fetchAllData)
@@ -557,12 +713,11 @@ function subscribeRealtime() {
 }
 
 async function patchLead(id, patch) {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevLeads = [...state.leads];
   state.leads = state.leads.map(l => l.id === id ? { ...l, ...patch } : l);
   render();
-  const { error, data } = await withAuthRetry(() => db.from("leads").update(patch).eq("id", id).select().single());
+  const { error, data } = await withAuthRetry(() => db.from("leads").update(patch).eq("id", id).eq("user_id", state.user.id).select().single());
   if (error) {
     console.error(error);
     state.leads = prevLeads;
@@ -577,7 +732,6 @@ async function patchLead(id, patch) {
 }
 
 async function completeLeadTask(id) {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = state.leads.find(l => l.id === id);
   if (!lead) return;
@@ -686,6 +840,114 @@ async function completeLeadTask(id) {
   showToast(`Gestión completada. +${pts} XP. Nueva tarea para ${nextDate}.`);
   render();
 }
+async function completeLeadTask(id) {
+  if (!(await ensureActiveSession())) return;
+  const lead = state.leads.find(l => l.id === id);
+  if (!lead) return;
+
+  const missing = [];
+  const contactVal = String(lead.contacto || "").trim();
+  if (!hasDirectChannel(lead)) missing.push("WhatsApp o email directo");
+  if (!contactVal || contactVal === "." || contactVal === "-" || contactVal.length < 2) missing.push("contacto valido");
+
+  if (missing.length) {
+    playErrorSound();
+    showToast(`No podes completar este foco. Falta: ${missing.join(" y ")}.`, "error");
+    return;
+  }
+
+  const currentTaskId = taskIdForLead(lead);
+  if (lead.last_rewarded_task_id === currentTaskId) {
+    playErrorSound();
+    showToast("Esa tarea ya fue completada. Ya no da recompensas.", "error");
+    return;
+  }
+
+  const pts = taskReward(lead);
+  const nextDate = addBusinessDays(todayStr(), 15);
+  const nextStreak = updateStreakOnTaskCompletion();
+  const focusKey = currentTaskId;
+
+  const prevLeads = [...state.leads];
+  const prevTasks = [...state.tasks];
+  const prevProfile = state.profile ? { ...state.profile } : null;
+  state.completedFocusKeys = [...new Set([...(state.completedFocusKeys || []), focusKey])];
+
+  const tempTask = {
+    id: `temp-task-${Date.now()}`,
+    user_id: state.user.id,
+    lead_id: lead.id,
+    title: `Recontactar a ${lead.empresa}`,
+    due_date: nextDate,
+    notes: nextAction(lead),
+    source: "gestion",
+    completed: false
+  };
+
+  state.leads = state.leads.map(l => l.id === id ? {
+    ...l,
+    ultimo_contacto: todayStr(),
+    proximo_seguimiento: nextDate,
+    estado: l.estado === "Nuevo" ? "Contactado" : l.estado,
+    last_rewarded_task_id: currentTaskId,
+    task_version: (l.task_version || 1) + 1
+  } : l);
+  state.tasks = [tempTask, ...state.tasks];
+  state.profile = {
+    ...(state.profile || {}),
+    xp: (state.profile?.xp || 0) + pts,
+    streak: nextStreak,
+    last_task_completed_on: todayStr()
+  };
+  render();
+
+  const leadUpdate = await withAuthRetry(() => db.from("leads").update({
+    ultimo_contacto: todayStr(),
+    proximo_seguimiento: nextDate,
+    estado: lead.estado === "Nuevo" ? "Contactado" : lead.estado,
+    last_rewarded_task_id: currentTaskId,
+    task_version: (lead.task_version || 1) + 1
+  }).eq("id", id).eq("user_id", state.user.id).select().single());
+  if (leadUpdate.error) {
+    console.error(leadUpdate.error);
+    state.leads = prevLeads;
+    state.tasks = prevTasks;
+    state.profile = prevProfile;
+    state.completedFocusKeys = (state.completedFocusKeys || []).filter(k => k !== focusKey);
+    render();
+    playErrorSound();
+    return showToast("No pude completar la gestion.", "error");
+  }
+
+  const taskInsert = await withAuthRetry(() => db.from("tasks").insert({
+    user_id: state.user.id,
+    lead_id: lead.id,
+    title: `Recontactar a ${lead.empresa}`,
+    due_date: nextDate,
+    notes: nextAction(lead),
+    source: "gestion"
+  }).select().single());
+  if (!taskInsert.error && taskInsert.data) {
+    state.tasks = state.tasks.map(t => t.id === tempTask.id ? taskInsert.data : t);
+  }
+
+  await updateProfile({
+    xp: (prevProfile?.xp || 0) + pts,
+    streak: nextStreak,
+    last_task_completed_on: todayStr()
+  });
+
+  if (leadUpdate.data) {
+    state.leads = state.leads.map(l => l.id === id ? leadUpdate.data : l);
+  }
+
+  playSuccessSound();
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("Gestion completada", { body: `${lead.empresa}: +${pts} XP. Nueva tarea para ${nextDate}.` });
+  }
+  showToast(`Gestion completada. +${pts} XP. Nueva tarea para ${nextDate}.`);
+  render();
+}
 window.completeLeadTask = completeLeadTask;
 
 function openLeadFromOutside(id) {
@@ -696,7 +958,7 @@ function openLeadFromOutside(id) {
 window.openLeadFromOutside = openLeadFromOutside;
 
 async function toggleCoachTask(id, done) {
-  const { error } = await db.from("coach_tasks").update({ done }).eq("id", id);
+  const { error } = await db.from("coach_tasks").update({ done }).eq("id", id).eq("user_id", state.user.id);
   if (error) {
     console.error(error);
     showToast("No pude actualizar el coach.");
@@ -704,7 +966,6 @@ async function toggleCoachTask(id, done) {
 }
 
 async function createManualTask() {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const title = $("taskTitleInput").value.trim();
   const dueDate = $("taskDateInput").value;
@@ -744,12 +1005,11 @@ async function createManualTask() {
 window.createManualTask = createManualTask;
 
 async function completeTaskItem(id) {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
   render();
-  const { error } = await withAuthRetry(() => db.from("tasks").update({ completed: true, completed_at: new Date().toISOString() }).eq("id", id));
+  const { error } = await withAuthRetry(() => db.from("tasks").update({ completed: true, completed_at: new Date().toISOString() }).eq("id", id).eq("user_id", state.user.id));
   if (error) {
     console.error(error);
     state.tasks = prevTasks;
@@ -761,12 +1021,11 @@ async function completeTaskItem(id) {
 window.completeTaskItem = completeTaskItem;
 
 async function deleteTaskItem(id) {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const prevTasks = [...state.tasks];
   state.tasks = state.tasks.filter(t => t.id !== id);
   render();
-  const { error } = await withAuthRetry(() => db.from("tasks").delete().eq("id", id));
+  const { error } = await withAuthRetry(() => db.from("tasks").delete().eq("id", id).eq("user_id", state.user.id));
   if (error) {
     console.error(error);
     state.tasks = prevTasks;
@@ -791,7 +1050,6 @@ function exportExcel() {
 }
 
 async function importExcel(file) {
-  if (!guardClientAlive()) return;
   const reader = new FileReader();
   reader.onload = async (e) => {
     const data = new Uint8Array(e.target.result);
@@ -835,8 +1093,87 @@ async function importExcel(file) {
   reader.readAsArrayBuffer(file);
 }
 
+function pickSheetValue(row, keys) {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "") return row[key];
+  }
+  return "";
+}
+
+function exportExcel() {
+  const data = state.leads.map(l => ({
+    Empresa: l.empresa,
+    "Encargado Comex": l.contacto,
+    "WhatsApp Comex": l.telefono,
+    "Email Comex": l.email,
+    Provincia: l.provincia,
+    Localidad: l.localidad,
+    Rubro: l.rubro,
+    Web: l.web,
+    Direccion: l.direccion,
+    "Origen habitual": l.origen_habitual,
+    "Tipo operaciones": l.tipo_operaciones,
+    Tamano: l.tamano,
+    Estado: l.estado,
+    Prioridad: l.prioridad,
+    Score: l.score,
+    "Ultimo contacto": l.ultimo_contacto,
+    "Proximo seguimiento": l.proximo_seguimiento,
+    Notas: l.notas
+  }));
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "CRM");
+  XLSX.writeFile(wb, `CRM_Prospectos_${(state.profile?.display_name || "usuario").replaceAll(" ","_")}.xlsx`);
+  showToast("Excel exportado.");
+}
+
+async function importExcel(file) {
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const data = new Uint8Array(e.target.result);
+    const wb = XLSX.read(data, { type: "array" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+    const mapped = rows.map((row) => ({
+      user_id: state.user.id,
+      empresa: String(pickSheetValue(row, ["Empresa", "empresa", "Company", "company"])).trim(),
+      contacto: String(pickSheetValue(row, ["Encargado Comex", "Contacto", "contacto", "Contacto Comex", "Responsable Comex", "responsable_comex"])).trim(),
+      telefono: String(pickSheetValue(row, ["WhatsApp Comex", "WhatsApp", "Whatsapp", "Celular", "Telefono", "Telefono Comex", "telefono"])).trim(),
+      email: String(pickSheetValue(row, ["Email Comex", "Email", "email", "Mail", "mail"])).trim(),
+      provincia: String(pickSheetValue(row, ["Provincia", "provincia"]) || "Sin dato").trim(),
+      localidad: String(pickSheetValue(row, ["Localidad", "localidad"])).trim(),
+      rubro: String(pickSheetValue(row, ["Rubro", "rubro"]) || "Sin clasificar").trim(),
+      web: String(pickSheetValue(row, ["Web", "web", "Sitio", "sitio"])).trim(),
+      direccion: String(pickSheetValue(row, ["Direccion", "direccion", "Dirección"])).trim(),
+      origen_habitual: String(pickSheetValue(row, ["Origen habitual", "origen_habitual", "Origen"])).trim(),
+      tipo_operaciones: String(pickSheetValue(row, ["Tipo operaciones", "tipo_operaciones", "Tipo"])).trim(),
+      tamano: String(pickSheetValue(row, ["Tamano", "tamano", "Tamaño"]) || "Sin dato").trim(),
+      estado: String(pickSheetValue(row, ["Estado", "estado"]) || "Nuevo").trim(),
+      prioridad: String(pickSheetValue(row, ["Prioridad", "prioridad"]) || "Media").trim(),
+      score: Number(pickSheetValue(row, ["Score", "score"]) || 0),
+      ultimo_contacto: String(pickSheetValue(row, ["Ultimo contacto", "último contacto", "ultimo_contacto"]) || "").trim() || null,
+      proximo_seguimiento: String(pickSheetValue(row, ["Proximo seguimiento", "próximo seguimiento", "proximo_seguimiento"]) || "").trim() || null,
+      notas: String(pickSheetValue(row, ["Notas", "notas", "Comentario", "comentario"])).trim(),
+      favorita: false,
+      task_version: 1,
+      last_rewarded_task_id: ""
+    })).filter(x => x.empresa);
+
+    if (!mapped.length) return showToast("No encontre filas validas.");
+    const result = await insertLeadBatches(mapped, "Importando leads");
+    if (result.error) {
+      console.error(result.error);
+      return showToast("No pude importar el Excel.");
+    }
+    showToast(`Se importaron ${result.inserted} contactos.`);
+    await fetchAllData();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
 async function saveModal() {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const payload = {
     empresa: $("mEmpresa").value.trim(),
@@ -882,7 +1219,7 @@ async function saveModal() {
     state.leads = state.leads.map(l => l.id === state.editingId ? { ...l, ...payload } : l);
     $("modalBg").style.display = "none";
     render();
-    const { data, error } = await withAuthRetry(() => db.from("leads").update(payload).eq("id", state.editingId).select().single());
+    const { data, error } = await withAuthRetry(() => db.from("leads").update(payload).eq("id", state.editingId).eq("user_id", state.user.id).select().single());
     if (error) {
       console.error(error);
       state.leads = prevLeads;
@@ -931,7 +1268,6 @@ function openModal(mode) {
 }
 
 async function deleteSelectedLead() {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
@@ -940,7 +1276,7 @@ async function deleteSelectedLead() {
   state.leads = state.leads.filter(l => l.id !== lead.id);
   state.selectedLeadId = state.leads[0]?.id || null;
   render();
-  const { error } = await withAuthRetry(() => db.from("leads").delete().eq("id", lead.id));
+  const { error } = await withAuthRetry(() => db.from("leads").delete().eq("id", lead.id).eq("user_id", state.user.id));
   if (error) {
     console.error(error);
     state.leads = prevLeads;
@@ -952,7 +1288,6 @@ async function deleteSelectedLead() {
 }
 
 async function toggleFavoriteSelected() {
-  if (!guardClientAlive()) return;
   if (!(await ensureActiveSession())) return;
   const lead = selectedLead();
   if (!lead) return;
@@ -1129,24 +1464,288 @@ function render() {
   notifyDueTasks();
 }
 
+function render() {
+  const activeXp = activeXpValue();
+  const decayXp = progressDecayValue();
+  const ct = currentTier();
+  const nt = nextTier();
+
+  $("headerSub").textContent = `${state.leads.length} leads cargados · ${state.profile?.display_name || state.user?.email || ""} · Rango activo: ${ct.label}`;
+
+  const m = metrics();
+  $("metricDue").textContent = m.due;
+  $("metricPhone").textContent = m.withoutPhone;
+  $("metricPriority").textContent = m.highPriority;
+  $("metricContacted").textContent = m.contacted;
+
+  $("tierEmoji").textContent = ct.emoji;
+  $("tierLabel").textContent = ct.label;
+  $("pointsValue").textContent = activeXp;
+  $("totalXpValue").textContent = state.profile?.xp || 0;
+  $("decayValue").textContent = decayXp;
+  $("streakValue").textContent = state.profile?.streak || 0;
+
+  const progress = nt ? Math.max(0, Math.min(100, ((activeXp - ct.min) / (nt.min - ct.min)) * 100)) : 100;
+  $("progressBar").style.width = `${progress}%`;
+  $("progressText").textContent = nt
+    ? `Te faltan ${Math.max(0, nt.min - activeXp)} XP activos para llegar a ${nt.label}.`
+    : "Ya estas en el nivel mas alto.";
+  $("streakMeta").textContent = !state.profile?.last_task_completed_on
+    ? "Empeza una racha para sostener el rango activo."
+    : decayXp
+      ? `La racha se corto: hoy estas perdiendo ${decayXp} XP activos por inactividad.`
+      : "Sin penalidad activa: tu racha esta sosteniendo el progreso.";
+  $("levelTrack").innerHTML = levelTrackHtml();
+
+  const motivationIndex = (Math.floor(Date.now() / (30 * 60 * 1000)) + activeXp + (state.profile?.streak || 0)) % MOTIVATIONS.length;
+  $("motivationBox").textContent = MOTIVATIONS[motivationIndex];
+
+  const provs = ["Todas", ...new Set(state.leads.map(l => l.provincia).filter(Boolean))];
+  const rubs = ["Todos", ...new Set(state.leads.map(l => l.rubro).filter(Boolean))];
+  const options = (arr, val) => arr.map(o => `<option value="${esc(o)}" ${o === val ? "selected" : ""}>${esc(o)}</option>`).join("");
+  $("filterProvincia").innerHTML = options(provs, state.filters.provincia);
+  $("filterRubro").innerHTML = options(rubs, state.filters.rubro);
+  $("filterEstado").innerHTML = options(ESTADOS, state.filters.estado);
+  $("searchInput").value = state.filters.query;
+  $("filterPend").checked = state.filters.soloPend;
+  $("filterFav").checked = state.filters.soloFav;
+
+  const leads = filteredLeads();
+  const selectedVisibleLead = leads.find(l => l.id === state.selectedLeadId);
+  const visibleLeads = selectedVisibleLead
+    ? [selectedVisibleLead, ...leads.filter(l => l.id !== state.selectedLeadId)].slice(0, 600)
+    : leads.slice(0, 600);
+  $("filteredCountTitle").textContent = visibleLeads.length < leads.length
+    ? `Leads filtrados (${visibleLeads.length} de ${leads.length})`
+    : `Leads filtrados (${leads.length})`;
+  $("leadList").innerHTML = visibleLeads.length ? visibleLeads.map(l => {
+    const heat = leadHeat(l);
+    const completeness = leadCompleteness(l);
+    return `
+      <button class="lead-item ${l.id === state.selectedLeadId ? "selected" : ""}" data-lead-id="${l.id}">
+        <div class="lead-item-head">
+          <div>
+            <div class="lead-item-name"><strong>${esc(l.empresa || "Sin empresa")}</strong></div>
+            <div class="lead-item-sub">${esc(l.contacto || "Sin encargado/a comex")} · ${esc(l.rubro || "Sin rubro")} · ${esc(l.provincia || "Sin provincia")}</div>
+          </div>
+          ${dueBadge(l)}
+        </div>
+        <div class="row" style="margin-top:12px">
+          <span class="badge">${esc(l.estado || "Nuevo")}</span>
+          <span class="badge">${esc(l.prioridad || "Media")}</span>
+          <span class="badge ${heat.cls}">${esc(heat.label)}</span>
+          <span class="badge">${completeness}% ficha</span>
+          ${l.favorita ? '<span class="badge">Favorito</span>' : ""}
+        </div>
+        <div class="row" style="margin-top:12px">
+          ${hasWhatsapp(l) ? `<span class="badge ok">WhatsApp listo</span>` : `<span class="badge">Sin WhatsApp</span>`}
+          ${hasEmail(l) ? `<span class="badge ok">Email listo</span>` : `<span class="badge">Sin email</span>`}
+          ${l.proximo_seguimiento ? `<span class="badge">Seguir ${esc(l.proximo_seguimiento)}</span>` : `<span class="badge">Sin fecha</span>`}
+        </div>
+        <div class="lead-item-notes">${esc(nextAction(l))}</div>
+      </button>
+    `;
+  }).join("") : `<div class="empty">No hay resultados con esos filtros.</div>`;
+  document.querySelectorAll("[data-lead-id]").forEach(btn => btn.onclick = () => {
+    state.selectedLeadId = btn.dataset.leadId;
+    render();
+  });
+
+  const lead = selectedLead();
+  if (!lead) {
+    $("detailTitle").textContent = "Selecciona un lead";
+    $("detailSub").textContent = "";
+    $("leadDetail").innerHTML = `<div class="empty">Elegi un lead para ver la ficha.</div>`;
+  } else {
+    const heat = leadHeat(lead);
+    const webValue = String(lead.web || "").trim();
+    const webHref = webValue ? (/^https?:\/\//i.test(webValue) ? webValue : `https://${webValue}`) : "";
+    const waHref = whatsappHref(lead.telefono);
+    const mailHref = emailHref(lead.email, lead);
+
+    $("detailTitle").textContent = lead.empresa || "Sin empresa";
+    $("detailSub").textContent = `${lead.rubro || "Sin rubro"} · ${lead.provincia || "Sin provincia"}${lead.localidad ? ` · ${lead.localidad}` : ""}`;
+    $("leadDetail").innerHTML = `
+      <div class="detail-grid">
+        <div class="detail-card"><div class="muted tiny">Encargado/a comex</div><strong>${esc(lead.contacto || "Sin dato")}</strong></div>
+        <div class="detail-card"><div class="muted tiny">Temperatura</div><strong>${esc(heat.label)}</strong><div class="muted tiny" style="margin-top:6px">Ficha ${leadCompleteness(lead)}% completa</div></div>
+        <div class="detail-card"><div class="muted tiny">WhatsApp comex</div><strong>${esc(lead.telefono || "Sin dato")}</strong></div>
+        <div class="detail-card"><div class="muted tiny">Email comex</div><strong>${esc(lead.email || "Sin dato")}</strong></div>
+      </div>
+
+      <div class="detail-card" style="margin-top:14px">
+        <div class="muted tiny">Acciones rapidas</div>
+        <div class="quick-actions">
+          ${waHref ? `<a class="quick-link" href="${esc(waHref)}" target="_blank" rel="noreferrer">Abrir WhatsApp</a>` : `<span class="badge">Falta WhatsApp</span>`}
+          ${mailHref ? `<a class="quick-link alt" href="${esc(mailHref)}">Enviar email</a>` : `<span class="badge">Falta email</span>`}
+          ${webHref ? `<a class="quick-link alt" href="${esc(webHref)}" target="_blank" rel="noreferrer">Ver web</a>` : `<span class="badge">Sin web</span>`}
+        </div>
+      </div>
+
+      <div class="tip-card" style="margin-top:14px"><div class="muted tiny">Siguiente accion</div><strong>${esc(nextAction(lead))}</strong></div>
+
+      <div class="detail-grid" style="margin-top:14px">
+        <div><label>Encargado/a comex</label><input id="detailContacto" value="${esc(lead.contacto || "")}" placeholder="Nombre y rol"></div>
+        <div><label>WhatsApp comex</label><input id="detailWhatsapp" value="${esc(lead.telefono || "")}" placeholder="+54 9 ..."></div>
+        <div><label>Email comex</label><input id="detailEmail" value="${esc(lead.email || "")}" placeholder="comex@empresa.com"></div>
+        <div><label>Web</label><input id="detailWeb" value="${esc(lead.web || "")}" placeholder="empresa.com"></div>
+        <div><label>Estado</label><select id="detailEstado">${ESTADOS.slice(1).map(o => `<option value="${esc(o)}" ${lead.estado === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select></div>
+        <div><label>Prioridad</label><select id="detailPrioridad">${PRIORIDADES.map(o => `<option value="${esc(o)}" ${lead.prioridad === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select></div>
+        <div><label>Ultimo contacto</label><input id="detailUltimo" type="date" value="${esc(lead.ultimo_contacto || "")}"></div>
+        <div><label>Proximo seguimiento</label><input id="detailProximo" type="date" value="${esc(lead.proximo_seguimiento || "")}"></div>
+      </div>
+
+      <div style="margin-top:14px"><label>Notas</label><textarea id="detailNotas">${esc(lead.notas || "")}</textarea></div>
+
+      <div class="row" style="margin-top:14px">
+        <button id="completeLeadBtn" class="btn primary">Completar gestion</button>
+        <button id="recontact15Btn" class="btn">Recontacto 15 habiles</button>
+      </div>
+    `;
+
+    $("detailContacto").onchange = e => patchLead(lead.id, { contacto: e.target.value });
+    $("detailWhatsapp").onchange = e => patchLead(lead.id, { telefono: e.target.value });
+    $("detailEmail").onchange = e => patchLead(lead.id, { email: e.target.value });
+    $("detailWeb").onchange = e => patchLead(lead.id, { web: e.target.value });
+    $("detailEstado").onchange = e => patchLead(lead.id, { estado: e.target.value });
+    $("detailPrioridad").onchange = e => patchLead(lead.id, { prioridad: e.target.value });
+    $("detailUltimo").onchange = e => patchLead(lead.id, { ultimo_contacto: e.target.value || null });
+    $("detailProximo").onchange = e => patchLead(lead.id, { proximo_seguimiento: e.target.value || null });
+    $("detailNotas").onchange = e => patchLead(lead.id, { notas: e.target.value });
+    $("completeLeadBtn").onclick = () => completeLeadTask(lead.id);
+    $("recontact15Btn").onclick = () => patchLead(lead.id, { proximo_seguimiento: addBusinessDays(todayStr(), 15), task_version: (lead.task_version || 1) + 1 });
+  }
+
+  const queue = actionableQueue();
+  $("focusGrid").innerHTML = queue.slice(0, 3).map((l, i) => `
+    <div class="focus-card">
+      <div class="muted tiny">Focus ${i + 1}</div>
+      <h3 style="margin-top:8px">${esc(l.empresa)}</h3>
+      <div class="muted">${esc(l.contacto || "Sin encargado/a")} · ${esc(l.rubro || "Sin rubro")} · ${esc(l.provincia || "Sin provincia")}</div>
+      <div style="margin-top:12px"><strong>Accion:</strong> ${esc(nextAction(l))}</div>
+      <div class="row" style="margin-top:14px">
+        <span class="badge ${leadHeat(l).cls}">${esc(leadHeat(l).label)}</span>
+        <span class="badge">${leadCompleteness(l)}% ficha</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary small" onclick="completeLeadTask('${l.id}')">Completar</button>
+        <button class="btn small" onclick="openLeadFromOutside('${l.id}')">Abrir</button>
+      </div>
+    </div>
+  `).join("") || `<div class="empty">No hay foco sugerido.</div>`;
+
+  const agendaItems = actionableQueue().slice(0, 20);
+  $("agendaList").innerHTML = agendaItems.length ? agendaItems.map((l, i) => `
+    <div class="task-card">
+      <div class="row between">
+        <div>
+          <div class="muted tiny">#${i + 1} recomendado</div>
+          <strong>${esc(l.empresa)}</strong>
+          <div class="muted">${esc(l.contacto || "Sin encargado/a")} · ${esc(l.rubro || "Sin rubro")} · ${esc(l.provincia || "Sin provincia")}</div>
+        </div>
+        ${dueBadge(l)}
+      </div>
+      <div style="margin-top:12px"><strong>Motivo:</strong> ${esc(nextAction(l))}</div>
+      <div class="row" style="margin-top:14px">
+        ${hasDirectChannel(l) ? '<span class="badge ok">Canal directo listo</span>' : '<span class="badge">Canal directo pendiente</span>'}
+        <span class="badge ${leadHeat(l).cls}">${esc(leadHeat(l).label)}</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary small" onclick="completeLeadTask('${l.id}')">Completar</button>
+        <button class="btn small" onclick="openLeadFromOutside('${l.id}')">Abrir</button>
+      </div>
+    </div>
+  `).join("") : `<div class="empty">No hay pendientes en agenda.</div>`;
+
+  $("coachTasksWrap").innerHTML = state.coachTasks.length ? state.coachTasks.map(t => `
+    <div class="tip-card">
+      <label class="checkbox-line">
+        <input type="checkbox" data-coach-id="${t.id}" ${t.done ? "checked" : ""}>
+        <div><strong style="${t.done ? "text-decoration:line-through;color:#94a3b8" : ""}">${esc(t.title)}</strong><div class="muted tiny" style="margin-top:4px">Objetivo del dia</div></div>
+      </label>
+    </div>
+  `).join("") : `<div class="empty">No hay coach cargado hoy.</div>`;
+  document.querySelectorAll("[data-coach-id]").forEach(cb => cb.onchange = () => toggleCoachTask(cb.dataset.coachId, cb.checked));
+
+  $("tipsWrap").innerHTML = rotatingTips().map(t => `<div class="tip-card"><strong>Consejo</strong><div class="muted" style="margin-top:6px">${esc(t)}</div></div>`).join("");
+
+  $("taskList").innerHTML = state.tasks.length ? state.tasks.map(t => `
+    <div class="card"><div class="cardBody">
+      <div class="row between">
+        <div>
+          <strong>${esc(t.title)}</strong>
+          <div class="muted tiny" style="margin-top:4px">${esc(t.due_date || "Sin fecha")} · ${t.source === "manual" ? "Manual" : "Gestion"}</div>
+        </div>
+        ${taskDueBadge(t)}
+      </div>
+      ${t.notes ? `<div class="muted" style="margin-top:10px">${esc(t.notes)}</div>` : ""}
+      <div class="row" style="margin-top:14px">
+        <button class="btn ok" onclick="completeTaskItem('${t.id}')">Completar</button>
+        <button class="btn danger" onclick="deleteTaskItem('${t.id}')">Borrar</button>
+      </div>
+    </div></div>
+  `).join("") : `<div class="empty">Todavia no hay tareas.</div>`;
+
+  document.querySelectorAll(".bottomnav button").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === state.activeTab));
+  ["inicio","leads","agenda","coach","tareas"].forEach(tab => $("tab-" + tab).classList.toggle("hidden", state.activeTab !== tab));
+  notifyDueTasks();
+}
+
+function openModal(mode) {
+  state.modalMode = mode;
+  const lead = mode === "edit" ? selectedLead() : null;
+  state.editingId = lead?.id || null;
+  $("modalTitle").textContent = mode === "create" ? "Nuevo lead" : "Editar lead";
+  $("modalSub").textContent = mode === "create" ? "Carga un lead nuevo" : "Modifica la ficha seleccionada";
+
+  const src = lead || {
+    empresa:"", contacto:"", telefono:"", email:"", provincia:"", localidad:"", rubro:"", web:"",
+    direccion:"", origen_habitual:"", tipo_operaciones:"", tamano:"", estado:"Nuevo", prioridad:"Media",
+    score:0, favorita:false, ultimo_contacto:"", proximo_seguimiento:"", notas:""
+  };
+  const set = (id, val) => $(id).value = val ?? "";
+  set("mEmpresa", src.empresa);
+  set("mContacto", src.contacto);
+  set("mTelefono", src.telefono);
+  set("mEmail", src.email);
+  set("mProvincia", src.provincia);
+  set("mLocalidad", src.localidad);
+  set("mRubro", src.rubro);
+  set("mWeb", src.web);
+  set("mDireccion", src.direccion);
+  set("mOrigen", src.origen_habitual);
+  set("mTipo", src.tipo_operaciones);
+  set("mTamano", src.tamano);
+  set("mScore", src.score || 0);
+  set("mUltimo", src.ultimo_contacto || "");
+  set("mProximo", src.proximo_seguimiento || "");
+  set("mNotas", src.notas);
+  $("mEstado").innerHTML = ESTADOS.slice(1).map(o => `<option value="${esc(o)}" ${src.estado === o ? "selected" : ""}>${esc(o)}</option>`).join("");
+  $("mPrioridad").innerHTML = PRIORIDADES.map(o => `<option value="${esc(o)}" ${src.prioridad === o ? "selected" : ""}>${esc(o)}</option>`).join("");
+  $("mFav").checked = !!src.favorita;
+  $("modalBg").style.display = "grid";
+}
+
 function initEvents() {
-  $("authPrimaryBtn").onclick = () => guardedAction(() => state.authMode === "login" ? login() : signup());
+  $("authPrimaryBtn").onclick = () => state.authMode === "login" ? login() : signup();
   $("authSwitchBtn").onclick = () => switchAuthMode(state.authMode === "login" ? "signup" : "login");
-  $("logoutBtn").onclick = () => guardedAction(() => logout());
-  $("newLeadBtn").onclick = () => guardedAction(() => openModal("create"));
-  $("editLeadBtn").onclick = () => guardedAction(() => { if (selectedLead()) openModal("edit"); });
-  $("favLeadBtn").onclick = () => guardedAction(() => toggleFavoriteSelected());
-  $("deleteLeadBtn").onclick = () => guardedAction(() => deleteSelectedLead());
+  $("authPasswordToggle").onclick = () => togglePasswordField("authPassword", "authPasswordToggle");
+  $("authConfirmToggle").onclick = () => togglePasswordField("authConfirmPassword", "authConfirmToggle");
+  $("logoutBtn").onclick = logout;
+  $("newLeadBtn").onclick = () => openModal("create");
+  $("editLeadBtn").onclick = () => { if (selectedLead()) openModal("edit"); };
+  $("favLeadBtn").onclick = toggleFavoriteSelected;
+  $("deleteLeadBtn").onclick = deleteSelectedLead;
   $("closeModalBtn").onclick = () => $("modalBg").style.display = "none";
   $("cancelModalBtn").onclick = () => $("modalBg").style.display = "none";
-  $("saveModalBtn").onclick = () => guardedAction(() => saveModal());
-  $("importBtn").onclick = () => guardedAction(() => $("excelInput").click());
+  $("saveModalBtn").onclick = saveModal;
+  $("importBtn").onclick = () => $("excelInput").click();
   $("excelInput").onchange = (e) => {
     if (e.target.files[0]) importExcel(e.target.files[0]);
     e.target.value = "";
   };
-  $("exportBtn").onclick = () => guardedAction(() => exportExcel());
-  $("notifyBtn").onclick = async () => guardedAction(async () => {
+  $("exportBtn").onclick = exportExcel;
+  $("notifyBtn").onclick = async () => {
     if (!("Notification" in window)) return showToast("Tu navegador no soporta notificaciones.");
     if (Notification.permission === "granted") {
       new Notification("CRM activo", { body: `Tenés ${metrics().due} seguimientos importantes para hoy.` });
@@ -1154,16 +1753,17 @@ function initEvents() {
       const permission = await Notification.requestPermission();
       if (permission === "granted") new Notification("Notificaciones activadas", { body: "Te voy a recordar seguimientos y tareas pendientes." });
     }
-  });
-  $("searchInput").oninput = (e) => { markActivity(); state.filters.query = e.target.value; window.__metricMode = ""; render(); };
-  $("filterProvincia").onchange = (e) => { markActivity(); state.filters.provincia = e.target.value; window.__metricMode = ""; render(); };
-  $("filterRubro").onchange = (e) => { markActivity(); state.filters.rubro = e.target.value; window.__metricMode = ""; render(); };
-  $("filterEstado").onchange = (e) => { markActivity(); state.filters.estado = e.target.value; window.__metricMode = ""; render(); };
-  $("filterPend").onchange = (e) => { markActivity(); state.filters.soloPend = e.target.checked; window.__metricMode = ""; render(); };
-  $("filterFav").onchange = (e) => { markActivity(); state.filters.soloFav = e.target.checked; window.__metricMode = ""; render(); };
-  document.querySelectorAll(".bottomnav button").forEach(btn => btn.onclick = () => { markActivity(); state.activeTab = btn.dataset.tab; render(); });
+  };
+  $("searchInput").oninput = (e) => { state.filters.query = e.target.value; window.__metricMode = ""; render(); };
+  $("filterProvincia").onchange = (e) => { state.filters.provincia = e.target.value; window.__metricMode = ""; render(); };
+  $("filterRubro").onchange = (e) => { state.filters.rubro = e.target.value; window.__metricMode = ""; render(); };
+  $("filterEstado").onchange = (e) => { state.filters.estado = e.target.value; window.__metricMode = ""; render(); };
+  $("filterPend").onchange = (e) => { state.filters.soloPend = e.target.checked; window.__metricMode = ""; render(); };
+  $("filterFav").onchange = (e) => { state.filters.soloFav = e.target.checked; window.__metricMode = ""; render(); };
+  document.querySelectorAll(".bottomnav button").forEach(btn => btn.onclick = () => { state.activeTab = btn.dataset.tab; render(); });
   document.querySelectorAll("[data-metric]").forEach(btn => btn.onclick = () => applyMetricFilter(btn.dataset.metric));
-  $("createTaskBtn").onclick = () => guardedAction(() => createManualTask());
+  $("createTaskBtn").onclick = createManualTask;
+  switchAuthMode("login");
 }
 
 async function start() {
@@ -1176,59 +1776,25 @@ async function start() {
   setInterval(async () => {
     if (!state.user) return;
     try {
-      if (guardClientAlive()) {
-        await refreshSessionIfNeeded();
-        render();
-      }
+      await refreshSessionIfNeeded();
+      render();
     } catch (e) {
       console.error(e);
     }
   }, 240000);
 
-  ["click","keydown","mousemove","touchstart","scroll"].forEach(evt => {
-    document.addEventListener(evt, markActivity, { passive: true });
-  });
-
   document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState === "hidden") {
-      hiddenAt = Date.now();
-      return;
-    }
-    markActivity();
-    if (!state.user) return;
-    if (shouldHardReloadAfterIdle()) {
-      hardReloadApp();
-      return;
-    }
-    try {
-      await refreshSessionIfNeeded();
-      await fetchAllData();
-      render();
-    } catch (e) {
-      console.error(e);
-      hardReloadApp("La sesión se perdió. Recargando...");
+    if (document.visibilityState === "visible" && state.user) {
+      try {
+        await refreshSessionIfNeeded();
+        await fetchAllData();
+        render();
+      } catch (e) {
+        console.error(e);
+        handleSessionExpired();
+      }
     }
   });
-
-  window.addEventListener("focus", () => {
-    markActivity();
-    if (state.user && shouldHardReloadAfterIdle()) {
-      hardReloadApp();
-    }
-  });
-
-  window.addEventListener("pageshow", () => {
-    markActivity();
-    if (state.user && shouldHardReloadAfterIdle()) {
-      hardReloadApp();
-    }
-  });
-
-  const reloadReason = sessionStorage.getItem("crm-sync-last-reload-reason");
-  if (reloadReason) {
-    sessionStorage.removeItem("crm-sync-last-reload-reason");
-    showToast(reloadReason);
-  }
 }
 
 start();
