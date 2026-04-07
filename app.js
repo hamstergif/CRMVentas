@@ -28,6 +28,8 @@ const TIERS = [
 const $ = (id) => document.getElementById(id);
 const LEADS_PAGE_SIZE = 1000;
 const IMPORT_BATCH_SIZE = 500;
+const EMAIL_CAPTURE_PATTERN = "[a-z0-9._%+\\-]+@[a-z0-9.\\-]+?(?:\\.com\\.ar|\\.net\\.ar|\\.org\\.ar|\\.gob\\.ar|\\.gov\\.ar|\\.edu\\.ar|\\.com\\.br|\\.com\\.mx|\\.co\\.uk|\\.com|\\.net|\\.org|\\.ar)";
+const AMBIGUOUS_MATCH = "__ambiguous__";
 const state = {
   authMode: "login",
   session: null,
@@ -134,12 +136,94 @@ function nextTier() {
   return TIERS.find(t => t.min > (state.profile?.xp || 0)) || null;
 }
 
+function splitLeadPieces(value) {
+  return String(value || "")
+    .split(/\s*\|\s*|\r?\n+|;/)
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function uniqueLeadValues(values, keyFn = value => String(value || "").toLowerCase()) {
+  const seen = new Set();
+  const result = [];
+  values.forEach(value => {
+    const raw = String(value || "").trim();
+    if (!raw) return;
+    const key = keyFn(raw);
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push(raw);
+  });
+  return result;
+}
+
+function extractEmailTokens(value) {
+  const raw = String(value || "").toLowerCase();
+  if (!raw) return [];
+  return uniqueLeadValues(
+    Array.from(raw.matchAll(new RegExp(EMAIL_CAPTURE_PATTERN, "gi"))).map(match => match[0]),
+    item => item.toLowerCase()
+  );
+}
+
+function contactValues(value) {
+  return uniqueLeadValues(splitLeadPieces(value), item => item.toLowerCase());
+}
+
+function emailValues(value) {
+  const matched = extractEmailTokens(value);
+  if (matched.length) return matched;
+  return uniqueLeadValues(
+    splitLeadPieces(String(value || "").toLowerCase()).filter(item => item.includes("@")),
+    item => item.toLowerCase()
+  );
+}
+
+function phoneIdentity(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function whatsappValues(value) {
+  return uniqueLeadValues(splitLeadPieces(value), item => phoneIdentity(item) || item.toLowerCase());
+}
+
+function valuesByKind(value, kind = "text") {
+  if (kind === "email") return emailValues(value);
+  if (kind === "phone") return whatsappValues(value);
+  return contactValues(value);
+}
+
+function normalizeMultiValue(value, kind = "text") {
+  return valuesByKind(value, kind).join(" | ");
+}
+
+function displayMultiValue(value, kind = "text") {
+  return valuesByKind(value, kind).join("\n");
+}
+
+function firstValue(value, kind = "text", fallback = "") {
+  return valuesByKind(value, kind)[0] || fallback;
+}
+
+function summaryValue(value, kind = "text", fallback = "Sin dato", max = 2) {
+  const items = valuesByKind(value, kind);
+  if (!items.length) return fallback;
+  if (items.length <= max) return items.join(" · ");
+  return `${items.slice(0, max).join(" · ")} +${items.length - max}`;
+}
+
+function countValueLabel(value, kind = "text", singular = "dato", plural = "datos") {
+  const count = valuesByKind(value, kind).length;
+  if (!count) return `Sin ${plural}`;
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
 function hasWhatsapp(lead) {
-  return !!String(lead?.telefono || "").trim();
+  return whatsappValues(lead?.telefono).length > 0;
 }
 
 function hasEmail(lead) {
-  return !!String(lead?.email || "").trim();
+  return emailValues(lead?.email).length > 0;
 }
 
 function hasDirectChannel(lead) {
@@ -147,8 +231,15 @@ function hasDirectChannel(lead) {
 }
 
 function leadCompleteness(lead) {
-  const checks = [lead?.empresa, lead?.contacto, lead?.telefono, lead?.email, lead?.proximo_seguimiento, lead?.notas];
-  const completed = checks.filter(v => String(v || "").trim()).length;
+  const checks = [
+    !!String(lead?.empresa || "").trim(),
+    contactValues(lead?.contacto).length > 0,
+    whatsappValues(lead?.telefono).length > 0,
+    emailValues(lead?.email).length > 0,
+    !!String(lead?.proximo_seguimiento || "").trim(),
+    !!String(lead?.notas || "").trim()
+  ];
+  const completed = checks.filter(Boolean).length;
   return Math.round((completed / checks.length) * 100);
 }
 
@@ -172,7 +263,7 @@ function leadHeat(lead) {
 }
 
 function normalizeWhatsapp(value) {
-  const digits = String(value || "").replace(/\D/g, "");
+  const digits = phoneIdentity(firstValue(value, "phone", value));
   if (!digits) return "";
   return digits.length > 10 || digits.startsWith("54") ? digits : `54${digits.replace(/^0+/, "")}`;
 }
@@ -183,7 +274,7 @@ function whatsappHref(value) {
 }
 
 function emailHref(value, lead) {
-  const email = String(value || "").trim();
+  const email = firstValue(value, "email", "").toLowerCase();
   if (!email) return "";
   const subject = encodeURIComponent(`Consulta comex - ${lead?.empresa || "empresa"}`);
   return `mailto:${email}?subject=${subject}`;
@@ -714,6 +805,12 @@ function subscribeRealtime() {
 
 async function patchLead(id, patch) {
   if (!(await ensureActiveSession())) return;
+  patch = {
+    ...patch,
+    ...(Object.prototype.hasOwnProperty.call(patch, "contacto") ? { contacto: normalizeMultiValue(patch.contacto, "text") } : {}),
+    ...(Object.prototype.hasOwnProperty.call(patch, "telefono") ? { telefono: normalizeMultiValue(patch.telefono, "phone") } : {}),
+    ...(Object.prototype.hasOwnProperty.call(patch, "email") ? { email: normalizeMultiValue(patch.email, "email") } : {})
+  };
   const prevLeads = [...state.leads];
   state.leads = state.leads.map(l => l.id === id ? { ...l, ...patch } : l);
   render();
@@ -1100,27 +1197,267 @@ function pickSheetValue(row, keys) {
   return "";
 }
 
+function pickMultiSheetValue(row, keys, kind = "text") {
+  return normalizeMultiValue(
+    keys
+      .map(key => row[key])
+      .filter(value => value !== undefined && value !== null && String(value).trim() !== "")
+      .join(" | "),
+    kind
+  );
+}
+
+function normalizeCompanyName(value, loose = false) {
+  const raw = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " y ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!loose) return raw;
+
+  const suffixes = new Set([
+    "sa", "srl", "sas", "ltda", "cia", "ciaa", "co", "inc", "corp",
+    "sociedad", "anonima", "responsabilidad", "limitada", "sr", "rl",
+    "s", "r", "l", "sacif", "sacifi", "sacifia", "saic", "saci", "saicyf"
+  ]);
+
+  return raw
+    .split(" ")
+    .filter(token => token && !suffixes.has(token))
+    .join(" ")
+    .trim();
+}
+
+function extractDomain(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (raw.includes("@")) return raw.split("@").pop().replace(/^www\./, "");
+  return raw
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .trim();
+}
+
+function extractDomains(value, kind = "text") {
+  const items = kind === "email" ? emailValues(value) : splitLeadPieces(value);
+  const domains = items.map(item => extractDomain(item)).filter(Boolean);
+  if (!domains.length) {
+    const fallback = extractDomain(value);
+    if (fallback) domains.push(fallback);
+  }
+  return uniqueLeadValues(domains, item => item.toLowerCase());
+}
+
+function mergePipeValue(currentValue, incomingValue, kind = "text") {
+  const merged = uniqueLeadValues([
+    ...valuesByKind(currentValue, kind),
+    ...valuesByKind(incomingValue, kind)
+  ], item => {
+    if (kind === "phone") return phoneIdentity(item) || item.toLowerCase();
+    return item.toLowerCase();
+  });
+  return merged.join(" | ");
+}
+
+function mergeTextBlock(currentValue, incomingValue) {
+  const current = String(currentValue || "").trim();
+  const incoming = String(incomingValue || "").trim();
+  if (!incoming) return current;
+  if (!current) return incoming;
+  return current.toLowerCase() === incoming.toLowerCase() ? current : `${current} | ${incoming}`;
+}
+
+function rememberDomainMatch(map, domainKey, lead) {
+  if (!domainKey) return;
+  const current = map.get(domainKey);
+  if (!current) {
+    map.set(domainKey, lead);
+    return;
+  }
+  if (current === AMBIGUOUS_MATCH) return;
+  if (current.id !== lead.id) map.set(domainKey, AMBIGUOUS_MATCH);
+}
+
+function buildLeadLookup(leads) {
+  const strict = new Map();
+  const loose = new Map();
+  const domain = new Map();
+
+  leads.forEach(lead => {
+    const strictKey = normalizeCompanyName(lead.empresa);
+    const looseKey = normalizeCompanyName(lead.empresa, true);
+    const mailDomains = extractDomains(lead.email, "email");
+    const webDomains = extractDomains(lead.web, "text");
+
+    if (strictKey && !strict.has(strictKey)) strict.set(strictKey, lead);
+    if (looseKey && !loose.has(looseKey)) loose.set(looseKey, lead);
+    mailDomains.forEach(domainKey => rememberDomainMatch(domain, domainKey, lead));
+    webDomains.forEach(domainKey => rememberDomainMatch(domain, domainKey, lead));
+  });
+
+  return { strict, loose, domain };
+}
+
+function findExistingLeadForImport(row, lookup) {
+  const strictKey = normalizeCompanyName(row.empresa);
+  const looseKey = normalizeCompanyName(row.empresa, true);
+  const rowDomains = [...extractDomains(row.email, "email"), ...extractDomains(row.web, "text")];
+  const domainMatch = rowDomains
+    .map(domainKey => lookup.domain.get(domainKey))
+    .find(match => match && match !== AMBIGUOUS_MATCH);
+
+  return lookup.strict.get(strictKey)
+    || lookup.loose.get(looseKey)
+    || domainMatch
+    || null;
+}
+
+function buildLeadImportPatch(existingLead, importedRow) {
+  const patch = {};
+
+  const mergedContacto = mergePipeValue(existingLead.contacto, importedRow.contacto, "text");
+  const mergedTelefono = mergePipeValue(existingLead.telefono, importedRow.telefono, "phone");
+  const mergedEmail = mergePipeValue(existingLead.email, importedRow.email, "email");
+  const mergedNotas = mergeTextBlock(existingLead.notas, importedRow.notas);
+
+  if (mergedContacto !== String(existingLead.contacto || "").trim()) patch.contacto = mergedContacto;
+  if (mergedTelefono !== String(existingLead.telefono || "").trim()) patch.telefono = mergedTelefono;
+  if (mergedEmail !== String(existingLead.email || "").trim()) patch.email = mergedEmail;
+  if (mergedNotas !== String(existingLead.notas || "").trim() && importedRow.notas) patch.notas = mergedNotas;
+
+  const fillIfEmpty = [
+    ["provincia", importedRow.provincia],
+    ["localidad", importedRow.localidad],
+    ["rubro", importedRow.rubro],
+    ["web", importedRow.web],
+    ["direccion", importedRow.direccion],
+    ["origen_habitual", importedRow.origen_habitual],
+    ["tipo_operaciones", importedRow.tipo_operaciones],
+    ["tamano", importedRow.tamano],
+    ["ultimo_contacto", importedRow.ultimo_contacto],
+    ["proximo_seguimiento", importedRow.proximo_seguimiento]
+  ];
+
+  fillIfEmpty.forEach(([field, value]) => {
+    if (!String(existingLead[field] || "").trim() && String(value || "").trim()) {
+      patch[field] = value;
+    }
+  });
+
+  if ((Number(importedRow.score) || 0) > (Number(existingLead.score) || 0)) {
+    patch.score = Number(importedRow.score) || 0;
+  }
+
+  if (existingLead.prioridad !== "Alta" && importedRow.prioridad === "Alta") {
+    patch.prioridad = "Alta";
+  }
+
+  return patch;
+}
+
+function mergeImportedRows(rows) {
+  const merged = new Map();
+
+  rows.forEach((row, index) => {
+    const key = normalizeCompanyName(row.empresa)
+      || extractDomains(row.email, "email")[0]
+      || extractDomains(row.web, "text")[0]
+      || `import-row-${index}`;
+
+    if (!merged.has(key)) {
+      merged.set(key, { ...row });
+      return;
+    }
+
+    const current = merged.get(key);
+    current.contacto = mergePipeValue(current.contacto, row.contacto, "text");
+    current.telefono = mergePipeValue(current.telefono, row.telefono, "phone");
+    current.email = mergePipeValue(current.email, row.email, "email");
+    current.notas = mergeTextBlock(current.notas, row.notas);
+
+    [
+      "provincia",
+      "localidad",
+      "rubro",
+      "web",
+      "direccion",
+      "origen_habitual",
+      "tipo_operaciones",
+      "tamano",
+      "ultimo_contacto",
+      "proximo_seguimiento"
+    ].forEach(field => {
+      if (!String(current[field] || "").trim() && String(row[field] || "").trim()) {
+        current[field] = row[field];
+      }
+    });
+
+    if ((Number(row.score) || 0) > (Number(current.score) || 0)) current.score = Number(row.score) || 0;
+    if (current.prioridad !== "Alta" && row.prioridad === "Alta") current.prioridad = "Alta";
+    if ((current.estado === "Nuevo" || !current.estado) && row.estado && row.estado !== "Nuevo") current.estado = row.estado;
+  });
+
+  return [...merged.values()];
+}
+
+async function applyLeadUpdatesInChunks(items, chunkSize = 30) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    const results = await Promise.all(chunk.map(item =>
+      withAuthRetry(() => db.from("leads")
+        .update(item.patch)
+        .eq("id", item.id)
+        .eq("user_id", state.user.id))
+    ));
+
+    const failed = results.find(result => result.error);
+    if (failed?.error) return failed;
+  }
+
+  return { error: null };
+}
+
 function exportExcel() {
-  const data = state.leads.map(l => ({
-    Empresa: l.empresa,
-    "Encargado Comex": l.contacto,
-    "WhatsApp Comex": l.telefono,
-    "Email Comex": l.email,
-    Provincia: l.provincia,
-    Localidad: l.localidad,
-    Rubro: l.rubro,
-    Web: l.web,
-    Direccion: l.direccion,
-    "Origen habitual": l.origen_habitual,
-    "Tipo operaciones": l.tipo_operaciones,
-    Tamano: l.tamano,
-    Estado: l.estado,
-    Prioridad: l.prioridad,
-    Score: l.score,
-    "Ultimo contacto": l.ultimo_contacto,
-    "Proximo seguimiento": l.proximo_seguimiento,
-    Notas: l.notas
-  }));
+  const data = state.leads.map(l => {
+    const contactos = contactValues(l.contacto);
+    const whatsapps = whatsappValues(l.telefono);
+    const emails = emailValues(l.email);
+    return {
+      Empresa: l.empresa,
+      "Encargado Comex": contactos[0] || "",
+      "Encargado Comex 2": contactos[1] || "",
+      "Encargado Comex 3": contactos[2] || "",
+      "Contactos Comex (todos)": contactos.join(" | "),
+      "WhatsApp Comex": whatsapps[0] || "",
+      "WhatsApp Comex 2": whatsapps[1] || "",
+      "WhatsApp Comex 3": whatsapps[2] || "",
+      "WhatsApps Comex (todos)": whatsapps.join(" | "),
+      "Email Comex": emails[0] || "",
+      "Email Comex 2": emails[1] || "",
+      "Email Comex 3": emails[2] || "",
+      "Email Comex 4": emails[3] || "",
+      "Emails Comex (todos)": emails.join(" | "),
+      Provincia: l.provincia,
+      Localidad: l.localidad,
+      Rubro: l.rubro,
+      Web: l.web,
+      Direccion: l.direccion,
+      "Origen habitual": l.origen_habitual,
+      "Tipo operaciones": l.tipo_operaciones,
+      Tamano: l.tamano,
+      Estado: l.estado,
+      Prioridad: l.prioridad,
+      Score: l.score,
+      "Ultimo contacto": l.ultimo_contacto,
+      "Proximo seguimiento": l.proximo_seguimiento,
+      Notas: l.notas
+    };
+  });
   const ws = XLSX.utils.json_to_sheet(data);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "CRM");
@@ -1136,12 +1473,48 @@ async function importExcel(file) {
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
 
-    const mapped = rows.map((row) => ({
+    const mapped = mergeImportedRows(rows.map((row) => ({
       user_id: state.user.id,
       empresa: String(pickSheetValue(row, ["Empresa", "empresa", "Company", "company"])).trim(),
-      contacto: String(pickSheetValue(row, ["Encargado Comex", "Contacto", "contacto", "Contacto Comex", "Responsable Comex", "responsable_comex"])).trim(),
-      telefono: String(pickSheetValue(row, ["WhatsApp Comex", "WhatsApp", "Whatsapp", "Celular", "Telefono", "Telefono Comex", "telefono"])).trim(),
-      email: String(pickSheetValue(row, ["Email Comex", "Email", "email", "Mail", "mail"])).trim(),
+      contacto: pickMultiSheetValue(row, [
+        "Contactos Comex (todos)",
+        "Encargado Comex",
+        "Encargado Comex 2",
+        "Encargado Comex 3",
+        "Contacto",
+        "Contacto 2",
+        "Contacto 3",
+        "contacto",
+        "Contacto Comex",
+        "Responsable Comex",
+        "Responsable Comex 2",
+        "responsable_comex"
+      ], "text"),
+      telefono: pickMultiSheetValue(row, [
+        "WhatsApps Comex (todos)",
+        "WhatsApp Comex",
+        "WhatsApp Comex 2",
+        "WhatsApp Comex 3",
+        "WhatsApp",
+        "Whatsapp",
+        "Celular",
+        "Telefono",
+        "Telefono Comex",
+        "telefono"
+      ], "phone"),
+      email: pickMultiSheetValue(row, [
+        "Emails Comex (todos)",
+        "Email Comex",
+        "Email Comex 2",
+        "Email Comex 3",
+        "Email Comex 4",
+        "Email",
+        "Email 2",
+        "Email 3",
+        "email",
+        "Mail",
+        "mail"
+      ], "email"),
       provincia: String(pickSheetValue(row, ["Provincia", "provincia"]) || "Sin dato").trim(),
       localidad: String(pickSheetValue(row, ["Localidad", "localidad"])).trim(),
       rubro: String(pickSheetValue(row, ["Rubro", "rubro"]) || "Sin clasificar").trim(),
@@ -1159,15 +1532,49 @@ async function importExcel(file) {
       favorita: false,
       task_version: 1,
       last_rewarded_task_id: ""
-    })).filter(x => x.empresa);
+    })).filter(x => x.empresa));
 
     if (!mapped.length) return showToast("No encontre filas validas.");
-    const result = await insertLeadBatches(mapped, "Importando leads");
-    if (result.error) {
-      console.error(result.error);
-      return showToast("No pude importar el Excel.");
+
+    const lookup = buildLeadLookup(state.leads || []);
+    const toCreate = [];
+    const toUpdate = [];
+    let unchanged = 0;
+
+    mapped.forEach(row => {
+      const existingLead = findExistingLeadForImport(row, lookup);
+      if (!existingLead) {
+        toCreate.push(row);
+        return;
+      }
+
+      const patch = buildLeadImportPatch(existingLead, row);
+      if (!Object.keys(patch).length) {
+        unchanged++;
+        return;
+      }
+
+      Object.assign(existingLead, patch);
+      toUpdate.push({ id: existingLead.id, patch });
+    });
+
+    if (toUpdate.length) {
+      const updateResult = await applyLeadUpdatesInChunks(toUpdate);
+      if (updateResult.error) {
+        console.error(updateResult.error);
+        return showToast("No pude actualizar los leads existentes.");
+      }
     }
-    showToast(`Se importaron ${result.inserted} contactos.`);
+
+    if (toCreate.length) {
+      const createResult = await insertLeadBatches(toCreate, "Importando leads");
+      if (createResult.error) {
+        console.error(createResult.error);
+        return showToast("No pude importar el Excel.");
+      }
+    }
+
+    showToast(`Importacion lista. ${toUpdate.length} actualizados, ${toCreate.length} nuevos, ${unchanged} sin cambios.`);
     await fetchAllData();
   };
   reader.readAsArrayBuffer(file);
@@ -1177,9 +1584,9 @@ async function saveModal() {
   if (!(await ensureActiveSession())) return;
   const payload = {
     empresa: $("mEmpresa").value.trim(),
-    contacto: $("mContacto").value.trim(),
-    telefono: $("mTelefono").value.trim(),
-    email: $("mEmail").value.trim(),
+    contacto: normalizeMultiValue($("mContacto").value, "text"),
+    telefono: normalizeMultiValue($("mTelefono").value, "phone"),
+    email: normalizeMultiValue($("mEmail").value, "email"),
     provincia: $("mProvincia").value.trim(),
     localidad: $("mLocalidad").value.trim(),
     rubro: $("mRubro").value.trim(),
@@ -1691,12 +2098,304 @@ function render() {
   notifyDueTasks();
 }
 
+function render() {
+  const activeXp = activeXpValue();
+  const decayXp = progressDecayValue();
+  const ct = currentTier();
+  const nt = nextTier();
+
+  $("headerSub").textContent = `${state.leads.length} leads cargados · ${state.profile?.display_name || state.user?.email || ""} · Rango activo: ${ct.label}`;
+
+  const m = metrics();
+  $("metricDue").textContent = m.due;
+  $("metricPhone").textContent = m.withoutPhone;
+  $("metricPriority").textContent = m.highPriority;
+  $("metricContacted").textContent = m.contacted;
+
+  $("tierEmoji").textContent = ct.emoji;
+  $("tierLabel").textContent = ct.label;
+  $("pointsValue").textContent = activeXp;
+  $("totalXpValue").textContent = state.profile?.xp || 0;
+  $("decayValue").textContent = decayXp;
+  $("streakValue").textContent = state.profile?.streak || 0;
+
+  const progress = nt ? Math.max(0, Math.min(100, ((activeXp - ct.min) / (nt.min - ct.min)) * 100)) : 100;
+  $("progressBar").style.width = `${progress}%`;
+  $("progressText").textContent = nt
+    ? `Te faltan ${Math.max(0, nt.min - activeXp)} XP activos para llegar a ${nt.label}.`
+    : "Ya estas en el nivel mas alto.";
+  $("streakMeta").textContent = !state.profile?.last_task_completed_on
+    ? "Empeza una racha para sostener el rango activo."
+    : decayXp
+      ? `La racha se corto: hoy estas perdiendo ${decayXp} XP activos por inactividad.`
+      : "Sin penalidad activa: tu racha esta sosteniendo el progreso.";
+  $("levelTrack").innerHTML = levelTrackHtml();
+
+  const motivationIndex = (Math.floor(Date.now() / (30 * 60 * 1000)) + activeXp + (state.profile?.streak || 0)) % MOTIVATIONS.length;
+  $("motivationBox").textContent = MOTIVATIONS[motivationIndex];
+
+  const provs = ["Todas", ...new Set(state.leads.map(l => l.provincia).filter(Boolean))];
+  const rubs = ["Todos", ...new Set(state.leads.map(l => l.rubro).filter(Boolean))];
+  const options = (arr, val) => arr.map(o => `<option value="${esc(o)}" ${o === val ? "selected" : ""}>${esc(o)}</option>`).join("");
+  $("filterProvincia").innerHTML = options(provs, state.filters.provincia);
+  $("filterRubro").innerHTML = options(rubs, state.filters.rubro);
+  $("filterEstado").innerHTML = options(ESTADOS, state.filters.estado);
+  $("searchInput").value = state.filters.query;
+  $("filterPend").checked = state.filters.soloPend;
+  $("filterFav").checked = state.filters.soloFav;
+
+  const leads = filteredLeads();
+  const selectedVisibleLead = leads.find(l => l.id === state.selectedLeadId);
+  const visibleLeads = selectedVisibleLead
+    ? [selectedVisibleLead, ...leads.filter(l => l.id !== state.selectedLeadId)].slice(0, 600)
+    : leads.slice(0, 600);
+
+  $("filteredCountTitle").textContent = visibleLeads.length < leads.length
+    ? `Leads filtrados (${visibleLeads.length} de ${leads.length})`
+    : `Leads filtrados (${leads.length})`;
+
+  $("leadList").innerHTML = visibleLeads.length ? visibleLeads.map(l => {
+    const heat = leadHeat(l);
+    const completeness = leadCompleteness(l);
+    const emailCount = emailValues(l.email).length;
+    const whatsappCount = whatsappValues(l.telefono).length;
+    return `
+      <button class="lead-item ${l.id === state.selectedLeadId ? "selected" : ""}" data-lead-id="${l.id}">
+        <div class="lead-item-head">
+          <div>
+            <div class="lead-item-name"><strong>${esc(l.empresa || "Sin empresa")}</strong></div>
+            <div class="lead-item-sub">${esc(summaryValue(l.contacto, "text", "Sin encargado/a comex", 1))} / ${esc(l.rubro || "Sin rubro")} / ${esc(l.provincia || "Sin provincia")}</div>
+          </div>
+          ${dueBadge(l)}
+        </div>
+        <div class="row" style="margin-top:12px">
+          <span class="badge">${esc(l.estado || "Nuevo")}</span>
+          <span class="badge">${esc(l.prioridad || "Media")}</span>
+          <span class="badge ${heat.cls}">${esc(heat.label)}</span>
+          <span class="badge">${completeness}% ficha</span>
+          ${l.favorita ? '<span class="badge">Favorito</span>' : ""}
+        </div>
+        <div class="row" style="margin-top:12px">
+          ${hasWhatsapp(l) ? `<span class="badge ok">${whatsappCount} WhatsApp${whatsappCount === 1 ? "" : "s"}</span>` : `<span class="badge">Sin WhatsApp</span>`}
+          ${hasEmail(l) ? `<span class="badge ok">${emailCount} email${emailCount === 1 ? "" : "s"}</span>` : `<span class="badge">Sin email</span>`}
+          ${l.proximo_seguimiento ? `<span class="badge">Seguir ${esc(l.proximo_seguimiento)}</span>` : `<span class="badge">Sin fecha</span>`}
+        </div>
+        <div class="lead-item-notes">${esc(nextAction(l))}</div>
+      </button>
+    `;
+  }).join("") : `<div class="empty">No hay resultados con esos filtros.</div>`;
+
+  document.querySelectorAll("[data-lead-id]").forEach(btn => btn.onclick = () => {
+    state.selectedLeadId = btn.dataset.leadId;
+    render();
+  });
+
+  const lead = selectedLead();
+  if (!lead) {
+    $("detailTitle").textContent = "Selecciona un lead";
+    $("detailSub").textContent = "";
+    $("leadDetail").innerHTML = `<div class="empty">Elegi un lead para ver la ficha.</div>`;
+  } else {
+    const heat = leadHeat(lead);
+    const contactList = contactValues(lead.contacto);
+    const whatsappList = whatsappValues(lead.telefono);
+    const emailList = emailValues(lead.email);
+    const webValue = String(lead.web || "").trim();
+    const webHref = webValue ? (/^https?:\/\//i.test(webValue) ? webValue : `https://${webValue}`) : "";
+    const waHref = whatsappHref(whatsappList[0] || "");
+    const mailHref = emailHref(emailList[0] || "", lead);
+
+    $("detailTitle").textContent = lead.empresa || "Sin empresa";
+    $("detailSub").textContent = `${lead.rubro || "Sin rubro"} / ${lead.provincia || "Sin provincia"}${lead.localidad ? ` / ${lead.localidad}` : ""} / ${emailList.length} mail${emailList.length === 1 ? "" : "s"} / ${whatsappList.length} WhatsApp${whatsappList.length === 1 ? "" : "s"}`;
+    $("leadDetail").innerHTML = `
+      <div class="detail-grid">
+        <div class="detail-card">
+          <div class="muted tiny">Encargados/as comex</div>
+          <strong>${esc(firstValue(lead.contacto, "text", "Sin dato"))}</strong>
+          <div class="summary-note">${esc(countValueLabel(lead.contacto, "text", "contacto", "contactos"))}</div>
+        </div>
+        <div class="detail-card">
+          <div class="muted tiny">Temperatura</div>
+          <strong>${esc(heat.label)}</strong>
+          <div class="summary-note">Ficha ${leadCompleteness(lead)}% completa</div>
+        </div>
+        <div class="detail-card">
+          <div class="muted tiny">WhatsApps comex</div>
+          <strong>${esc(firstValue(lead.telefono, "phone", "Sin dato"))}</strong>
+          <div class="summary-note">${esc(countValueLabel(lead.telefono, "phone", "WhatsApp", "WhatsApps"))}</div>
+        </div>
+        <div class="detail-card">
+          <div class="muted tiny">Emails comex</div>
+          <strong>${esc(firstValue(lead.email, "email", "Sin dato"))}</strong>
+          <div class="summary-note">${esc(countValueLabel(lead.email, "email", "email", "emails"))}</div>
+        </div>
+      </div>
+
+      <div class="detail-card" style="margin-top:14px">
+        <div class="muted tiny">Acciones rapidas</div>
+        <div class="quick-actions">
+          ${waHref ? `<a class="quick-link" href="${esc(waHref)}" target="_blank" rel="noreferrer">Abrir WhatsApp</a>` : `<span class="badge">Falta WhatsApp</span>`}
+          ${mailHref ? `<a class="quick-link alt" href="${esc(mailHref)}">Enviar email</a>` : `<span class="badge">Falta email</span>`}
+          ${webHref ? `<a class="quick-link alt" href="${esc(webHref)}" target="_blank" rel="noreferrer">Ver web</a>` : `<span class="badge">Sin web</span>`}
+        </div>
+      </div>
+
+      <div class="detail-card" style="margin-top:14px">
+        <div class="muted tiny">Canales comex</div>
+        <div class="value-groups">
+          <div class="value-group">
+            <div class="value-group-head"><strong>Responsables</strong><span class="badge">${contactList.length}</span></div>
+            <div class="value-list">
+              ${contactList.length ? contactList.map(contact => `<span class="value-chip alt">${esc(contact)}</span>`).join("") : `<span class="badge">Sin responsables</span>`}
+            </div>
+          </div>
+          <div class="value-group">
+            <div class="value-group-head"><strong>WhatsApps</strong><span class="badge">${whatsappList.length}</span></div>
+            <div class="value-list">
+              ${whatsappList.length ? whatsappList.map(phone => {
+                const href = whatsappHref(phone);
+                return href
+                  ? `<a class="value-chip action" href="${esc(href)}" target="_blank" rel="noreferrer">${esc(phone)}</a>`
+                  : `<span class="value-chip">${esc(phone)}</span>`;
+              }).join("") : `<span class="badge">Sin WhatsApps</span>`}
+            </div>
+          </div>
+          <div class="value-group">
+            <div class="value-group-head"><strong>Emails</strong><span class="badge">${emailList.length}</span></div>
+            <div class="value-list">
+              ${emailList.length ? emailList.map(email => `<a class="value-chip action" href="${esc(emailHref(email, lead))}">${esc(email)}</a>`).join("") : `<span class="badge">Sin emails</span>`}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tip-card" style="margin-top:14px"><div class="muted tiny">Siguiente accion</div><strong>${esc(nextAction(lead))}</strong></div>
+
+      <div class="detail-grid" style="margin-top:14px">
+        <div class="span-2">
+          <label>Encargados/as comex</label>
+          <textarea id="detailContacto" class="compact-area" placeholder="Uno por linea">${esc(displayMultiValue(lead.contacto, "text"))}</textarea>
+          <div class="field-help">Uno por linea o separado con |.</div>
+        </div>
+        <div class="span-2">
+          <label>WhatsApps comex</label>
+          <textarea id="detailWhatsapp" class="compact-area" placeholder="+54 9 ...">${esc(displayMultiValue(lead.telefono, "phone"))}</textarea>
+          <div class="field-help">La ficha guarda varios numeros en un mismo lead.</div>
+        </div>
+        <div class="span-2">
+          <label>Emails comex</label>
+          <textarea id="detailEmail" class="compact-area" placeholder="comex@empresa.com">${esc(displayMultiValue(lead.email, "email"))}</textarea>
+          <div class="field-help">Tambien podes pegar varios mails juntos y la web los normaliza.</div>
+        </div>
+        <div><label>Web</label><input id="detailWeb" value="${esc(lead.web || "")}" placeholder="empresa.com"></div>
+        <div><label>Estado</label><select id="detailEstado">${ESTADOS.slice(1).map(o => `<option value="${esc(o)}" ${lead.estado === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select></div>
+        <div><label>Prioridad</label><select id="detailPrioridad">${PRIORIDADES.map(o => `<option value="${esc(o)}" ${lead.prioridad === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select></div>
+        <div><label>Ultimo contacto</label><input id="detailUltimo" type="date" value="${esc(lead.ultimo_contacto || "")}"></div>
+        <div><label>Proximo seguimiento</label><input id="detailProximo" type="date" value="${esc(lead.proximo_seguimiento || "")}"></div>
+      </div>
+
+      <div style="margin-top:14px"><label>Notas</label><textarea id="detailNotas">${esc(lead.notas || "")}</textarea></div>
+
+      <div class="row" style="margin-top:14px">
+        <button id="completeLeadBtn" class="btn primary">Completar gestion</button>
+        <button id="recontact15Btn" class="btn">Recontacto 15 habiles</button>
+      </div>
+    `;
+
+    $("detailContacto").onchange = e => patchLead(lead.id, { contacto: e.target.value });
+    $("detailWhatsapp").onchange = e => patchLead(lead.id, { telefono: e.target.value });
+    $("detailEmail").onchange = e => patchLead(lead.id, { email: e.target.value });
+    $("detailWeb").onchange = e => patchLead(lead.id, { web: e.target.value });
+    $("detailEstado").onchange = e => patchLead(lead.id, { estado: e.target.value });
+    $("detailPrioridad").onchange = e => patchLead(lead.id, { prioridad: e.target.value });
+    $("detailUltimo").onchange = e => patchLead(lead.id, { ultimo_contacto: e.target.value || null });
+    $("detailProximo").onchange = e => patchLead(lead.id, { proximo_seguimiento: e.target.value || null });
+    $("detailNotas").onchange = e => patchLead(lead.id, { notas: e.target.value });
+    $("completeLeadBtn").onclick = () => completeLeadTask(lead.id);
+    $("recontact15Btn").onclick = () => patchLead(lead.id, { proximo_seguimiento: addBusinessDays(todayStr(), 15), task_version: (lead.task_version || 1) + 1 });
+  }
+
+  const queue = actionableQueue();
+  $("focusGrid").innerHTML = queue.slice(0, 3).map((l, i) => `
+    <div class="focus-card">
+      <div class="muted tiny">Focus ${i + 1}</div>
+      <h3 style="margin-top:8px">${esc(l.empresa)}</h3>
+      <div class="muted">${esc(summaryValue(l.contacto, "text", "Sin encargado/a", 1))} / ${esc(l.rubro || "Sin rubro")} / ${esc(l.provincia || "Sin provincia")}</div>
+      <div style="margin-top:12px"><strong>Accion:</strong> ${esc(nextAction(l))}</div>
+      <div class="row" style="margin-top:14px">
+        <span class="badge ${leadHeat(l).cls}">${esc(leadHeat(l).label)}</span>
+        <span class="badge">${leadCompleteness(l)}% ficha</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary small" onclick="completeLeadTask('${l.id}')">Completar</button>
+        <button class="btn small" onclick="openLeadFromOutside('${l.id}')">Abrir</button>
+      </div>
+    </div>
+  `).join("") || `<div class="empty">No hay foco sugerido.</div>`;
+
+  const agendaItems = actionableQueue().slice(0, 20);
+  $("agendaList").innerHTML = agendaItems.length ? agendaItems.map((l, i) => `
+    <div class="task-card">
+      <div class="row between">
+        <div>
+          <div class="muted tiny">#${i + 1} recomendado</div>
+          <strong>${esc(l.empresa)}</strong>
+          <div class="muted">${esc(summaryValue(l.contacto, "text", "Sin encargado/a", 1))} / ${esc(l.rubro || "Sin rubro")} / ${esc(l.provincia || "Sin provincia")}</div>
+        </div>
+        ${dueBadge(l)}
+      </div>
+      <div style="margin-top:12px"><strong>Motivo:</strong> ${esc(nextAction(l))}</div>
+      <div class="row" style="margin-top:14px">
+        ${hasDirectChannel(l) ? '<span class="badge ok">Canal directo listo</span>' : '<span class="badge">Canal directo pendiente</span>'}
+        <span class="badge ${leadHeat(l).cls}">${esc(leadHeat(l).label)}</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary small" onclick="completeLeadTask('${l.id}')">Completar</button>
+        <button class="btn small" onclick="openLeadFromOutside('${l.id}')">Abrir</button>
+      </div>
+    </div>
+  `).join("") : `<div class="empty">No hay pendientes en agenda.</div>`;
+
+  $("coachTasksWrap").innerHTML = state.coachTasks.length ? state.coachTasks.map(t => `
+    <div class="tip-card">
+      <label class="checkbox-line">
+        <input type="checkbox" data-coach-id="${t.id}" ${t.done ? "checked" : ""}>
+        <div><strong style="${t.done ? "text-decoration:line-through;color:#94a3b8" : ""}">${esc(t.title)}</strong><div class="muted tiny" style="margin-top:4px">Objetivo del dia</div></div>
+      </label>
+    </div>
+  `).join("") : `<div class="empty">No hay coach cargado hoy.</div>`;
+  document.querySelectorAll("[data-coach-id]").forEach(cb => cb.onchange = () => toggleCoachTask(cb.dataset.coachId, cb.checked));
+
+  $("tipsWrap").innerHTML = rotatingTips().map(t => `<div class="tip-card"><strong>Consejo</strong><div class="muted" style="margin-top:6px">${esc(t)}</div></div>`).join("");
+
+  $("taskList").innerHTML = state.tasks.length ? state.tasks.map(t => `
+    <div class="card"><div class="cardBody">
+      <div class="row between">
+        <div>
+          <strong>${esc(t.title)}</strong>
+          <div class="muted tiny" style="margin-top:4px">${esc(t.due_date || "Sin fecha")} · ${t.source === "manual" ? "Manual" : "Gestion"}</div>
+        </div>
+        ${taskDueBadge(t)}
+      </div>
+      ${t.notes ? `<div class="muted" style="margin-top:10px">${esc(t.notes)}</div>` : ""}
+      <div class="row" style="margin-top:14px">
+        <button class="btn ok" onclick="completeTaskItem('${t.id}')">Completar</button>
+        <button class="btn danger" onclick="deleteTaskItem('${t.id}')">Borrar</button>
+      </div>
+    </div></div>
+  `).join("") : `<div class="empty">Todavia no hay tareas.</div>`;
+
+  document.querySelectorAll(".bottomnav button").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === state.activeTab));
+  ["inicio","leads","agenda","coach","tareas"].forEach(tab => $("tab-" + tab).classList.toggle("hidden", state.activeTab !== tab));
+  notifyDueTasks();
+}
+
 function openModal(mode) {
   state.modalMode = mode;
   const lead = mode === "edit" ? selectedLead() : null;
   state.editingId = lead?.id || null;
   $("modalTitle").textContent = mode === "create" ? "Nuevo lead" : "Editar lead";
-  $("modalSub").textContent = mode === "create" ? "Carga un lead nuevo" : "Modifica la ficha seleccionada";
+  $("modalSub").textContent = mode === "create" ? "Carga un lead nuevo con varios contactos si hace falta" : "Modifica la ficha seleccionada y sus canales comex";
 
   const src = lead || {
     empresa:"", contacto:"", telefono:"", email:"", provincia:"", localidad:"", rubro:"", web:"",
@@ -1705,9 +2404,9 @@ function openModal(mode) {
   };
   const set = (id, val) => $(id).value = val ?? "";
   set("mEmpresa", src.empresa);
-  set("mContacto", src.contacto);
-  set("mTelefono", src.telefono);
-  set("mEmail", src.email);
+  set("mContacto", displayMultiValue(src.contacto, "text"));
+  set("mTelefono", displayMultiValue(src.telefono, "phone"));
+  set("mEmail", displayMultiValue(src.email, "email"));
   set("mProvincia", src.provincia);
   set("mLocalidad", src.localidad);
   set("mRubro", src.rubro);

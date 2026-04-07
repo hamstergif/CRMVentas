@@ -291,9 +291,21 @@
 
         <div class="grid g5" style="margin-top:16px">
           <div><label>Empresa</label><input id="mEmpresa" placeholder="Nombre de la empresa"></div>
-          <div><label>Encargado/a comex</label><input id="mContacto" placeholder="Nombre y rol"></div>
-          <div><label>WhatsApp comex</label><input id="mTelefono" placeholder="+54 9 ..."></div>
-          <div><label>Email comex</label><input id="mEmail" placeholder="comex@empresa.com"></div>
+          <div class="span-2">
+            <label>Encargados/as comex</label>
+            <textarea id="mContacto" class="compact-area" placeholder="Un nombre por linea"></textarea>
+            <div class="field-help">Podes cargar varios responsables. Uno por linea o separado con `|`.</div>
+          </div>
+          <div class="span-2">
+            <label>WhatsApps comex</label>
+            <textarea id="mTelefono" class="compact-area" placeholder="+54 9 ..."></textarea>
+            <div class="field-help">Carga varios numeros si hace falta. Uno por linea o separado con `|`.</div>
+          </div>
+          <div class="span-2">
+            <label>Emails comex</label>
+            <textarea id="mEmail" class="compact-area" placeholder="comex@empresa.com"></textarea>
+            <div class="field-help">La web ahora entiende varios mails por empresa.</div>
+          </div>
           <div><label>Provincia</label><input id="mProvincia"></div>
           <div><label>Localidad</label><input id="mLocalidad"></div>
           <div><label>Rubro</label><input id="mRubro"></div>
