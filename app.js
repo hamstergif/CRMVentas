@@ -1147,12 +1147,22 @@ function exportExcel() {
 }
 
 async function importExcel(file) {
+  if (!(await ensureActiveSession())) return;
+  if (!file) return showToast("Elegí un archivo para importar.");
+  if (typeof XLSX === "undefined") return showToast("No pude cargar el motor de importacion. Recarga la pagina y proba de nuevo.");
   const reader = new FileReader();
+  reader.onerror = () => {
+    console.error("No pude leer el archivo seleccionado.", reader.error);
+    showToast("No pude leer el archivo. Probá con otro CSV o Excel.");
+  };
   reader.onload = async (e) => {
-    const data = new Uint8Array(e.target.result);
-    const wb = XLSX.read(data, { type: "array" });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+    try {
+      if (!(await ensureActiveSession())) return;
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      if (!ws) return showToast("No encontre ninguna hoja para importar.");
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
     const mapped = rows.map((x) => ({
       user_id: state.user.id,
       empresa: String(x.Empresa || x.empresa || "").trim(),
@@ -1184,8 +1194,12 @@ async function importExcel(file) {
       console.error(error);
       return showToast("No pude importar el Excel.");
     }
-    showToast(`Se importaron ${mapped.length} contactos.`);
-    await fetchAllData();
+      showToast(`Se importaron ${mapped.length} contactos.`);
+      await fetchAllData();
+    } catch (error) {
+      console.error("Fallo la importacion.", error);
+      showToast(`Fallo la importacion: ${error?.message || "error inesperado"}`);
+    }
   };
   reader.readAsArrayBuffer(file);
 }
@@ -1534,7 +1548,9 @@ async function importExcel(file) {
       last_rewarded_task_id: ""
     })).filter(x => x.empresa));
 
-    if (!mapped.length) return showToast("No encontre filas validas.");
+    if (!mapped.length) return showToast("No encontre filas validas con la columna Empresa.");
+
+    showToast(`Procesando ${mapped.length} filas...`);
 
     const lookup = buildLeadLookup(state.leads || []);
     const toCreate = [];
@@ -1566,16 +1582,25 @@ async function importExcel(file) {
       }
     }
 
-    if (toCreate.length) {
-      const createResult = await insertLeadBatches(toCreate, "Importando leads");
-      if (createResult.error) {
-        console.error(createResult.error);
-        return showToast("No pude importar el Excel.");
+      if (toCreate.length) {
+        const createResult = await insertLeadBatches(toCreate, "Importando leads");
+        if (createResult.error) {
+          console.error(createResult.error);
+          return showToast("No pude importar el archivo.");
+        }
       }
-    }
 
-    showToast(`Importacion lista. ${toUpdate.length} actualizados, ${toCreate.length} nuevos, ${unchanged} sin cambios.`);
-    await fetchAllData();
+      window.__lastImportSummary = {
+        fileName: file.name,
+        rowsRead: rows.length,
+        rowsProcessed: mapped.length,
+        updated: toUpdate.length,
+        created: toCreate.length,
+        unchanged
+      };
+
+      showToast(`Importacion lista. ${toUpdate.length} actualizados, ${toCreate.length} nuevos, ${unchanged} sin cambios.`);
+      await fetchAllData();
   };
   reader.readAsArrayBuffer(file);
 }
@@ -2463,6 +2488,151 @@ function initEvents() {
   document.querySelectorAll("[data-metric]").forEach(btn => btn.onclick = () => applyMetricFilter(btn.dataset.metric));
   $("createTaskBtn").onclick = createManualTask;
   switchAuthMode("login");
+}
+
+async function importExcel(file) {
+  if (!(await ensureActiveSession())) return;
+  if (!file) return showToast("Elegí un archivo para importar.");
+  if (typeof XLSX === "undefined") return showToast("No pude cargar el motor de importacion. Recarga la pagina y proba de nuevo.");
+
+  const reader = new FileReader();
+  reader.onerror = () => {
+    console.error("No pude leer el archivo seleccionado.", reader.error);
+    showToast("No pude leer el archivo. Probá con otro CSV o Excel.");
+  };
+
+  reader.onload = async (e) => {
+    try {
+      if (!(await ensureActiveSession())) return;
+
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: "array" });
+      const firstSheetName = wb.SheetNames?.[0];
+      const ws = firstSheetName ? wb.Sheets[firstSheetName] : null;
+      if (!ws) return showToast("No encontre ninguna hoja para importar.");
+
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
+      const mapped = mergeImportedRows(rows.map((row) => ({
+        user_id: state.user.id,
+        empresa: String(pickSheetValue(row, ["Empresa", "empresa", "Company", "company"])).trim(),
+        contacto: pickMultiSheetValue(row, [
+          "Contactos Comex (todos)",
+          "Encargado Comex",
+          "Encargado Comex 2",
+          "Encargado Comex 3",
+          "Contacto",
+          "Contacto 2",
+          "Contacto 3",
+          "contacto",
+          "Contacto Comex",
+          "Responsable Comex",
+          "Responsable Comex 2",
+          "responsable_comex"
+        ], "text"),
+        telefono: pickMultiSheetValue(row, [
+          "WhatsApps Comex (todos)",
+          "WhatsApp Comex",
+          "WhatsApp Comex 2",
+          "WhatsApp Comex 3",
+          "WhatsApp",
+          "Whatsapp",
+          "Celular",
+          "Telefono",
+          "Telefono Comex",
+          "telefono"
+        ], "phone"),
+        email: pickMultiSheetValue(row, [
+          "Emails Comex (todos)",
+          "Email Comex",
+          "Email Comex 2",
+          "Email Comex 3",
+          "Email Comex 4",
+          "Email",
+          "Email 2",
+          "Email 3",
+          "email",
+          "Mail",
+          "mail"
+        ], "email"),
+        provincia: String(pickSheetValue(row, ["Provincia", "provincia"]) || "Sin dato").trim(),
+        localidad: String(pickSheetValue(row, ["Localidad", "localidad"])).trim(),
+        rubro: String(pickSheetValue(row, ["Rubro", "rubro"]) || "Sin clasificar").trim(),
+        web: String(pickSheetValue(row, ["Web", "web", "Sitio", "sitio"])).trim(),
+        direccion: String(pickSheetValue(row, ["Direccion", "direccion", "Dirección", "DirecciÃ³n"])).trim(),
+        origen_habitual: String(pickSheetValue(row, ["Origen habitual", "origen_habitual", "Origen"])).trim(),
+        tipo_operaciones: String(pickSheetValue(row, ["Tipo operaciones", "tipo_operaciones", "Tipo"])).trim(),
+        tamano: String(pickSheetValue(row, ["Tamano", "tamano", "Tamaño", "TamaÃ±o"]) || "Sin dato").trim(),
+        estado: String(pickSheetValue(row, ["Estado", "estado"]) || "Nuevo").trim(),
+        prioridad: String(pickSheetValue(row, ["Prioridad", "prioridad"]) || "Media").trim(),
+        score: Number(pickSheetValue(row, ["Score", "score"]) || 0),
+        ultimo_contacto: String(pickSheetValue(row, ["Ultimo contacto", "último contacto", "Ãºltimo contacto", "ultimo_contacto"]) || "").trim() || null,
+        proximo_seguimiento: String(pickSheetValue(row, ["Proximo seguimiento", "próximo seguimiento", "prÃ³ximo seguimiento", "proximo_seguimiento"]) || "").trim() || null,
+        notas: String(pickSheetValue(row, ["Notas", "notas", "Comentario", "comentario"])).trim(),
+        favorita: false,
+        task_version: 1,
+        last_rewarded_task_id: ""
+      })).filter(row => row.empresa));
+
+      if (!mapped.length) return showToast("No encontre filas validas con la columna Empresa.");
+
+      showToast(`Procesando ${mapped.length} filas...`);
+
+      const lookup = buildLeadLookup(state.leads || []);
+      const toCreate = [];
+      const toUpdate = [];
+      let unchanged = 0;
+
+      mapped.forEach(row => {
+        const existingLead = findExistingLeadForImport(row, lookup);
+        if (!existingLead) {
+          toCreate.push(row);
+          return;
+        }
+
+        const patch = buildLeadImportPatch(existingLead, row);
+        if (!Object.keys(patch).length) {
+          unchanged++;
+          return;
+        }
+
+        Object.assign(existingLead, patch);
+        toUpdate.push({ id: existingLead.id, patch });
+      });
+
+      if (toUpdate.length) {
+        const updateResult = await applyLeadUpdatesInChunks(toUpdate);
+        if (updateResult.error) {
+          console.error(updateResult.error);
+          return showToast("No pude actualizar los leads existentes.");
+        }
+      }
+
+      if (toCreate.length) {
+        const createResult = await insertLeadBatches(toCreate, "Importando leads");
+        if (createResult.error) {
+          console.error(createResult.error);
+          return showToast("No pude importar el archivo.");
+        }
+      }
+
+      window.__lastImportSummary = {
+        fileName: file.name,
+        rowsRead: rows.length,
+        rowsProcessed: mapped.length,
+        updated: toUpdate.length,
+        created: toCreate.length,
+        unchanged
+      };
+
+      showToast(`Importacion lista. ${toUpdate.length} actualizados, ${toCreate.length} nuevos, ${unchanged} sin cambios.`);
+      await fetchAllData();
+    } catch (error) {
+      console.error("Fallo la importacion.", error);
+      showToast(`Fallo la importacion: ${error?.message || "error inesperado"}`);
+    }
+  };
+
+  reader.readAsArrayBuffer(file);
 }
 
 async function start() {
